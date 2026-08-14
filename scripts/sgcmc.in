@@ -1,0 +1,24 @@
+pair_style ${pair_style} 
+pair_coeff * * ${pair_file} ${elements} ${elements}
+
+displace_atoms all random 0.1 0.1 0.1 ${seed}
+
+if "$(!is_defined(variable,Bswap))" then "variable Bswap string NULL"
+
+fix MC all hgcmc ${T} ${seed} ${Nmd} mu ${mus} sgcmc ${Pswap} ${Nswap} ${Bswap} ${MCbox} ${Pbox} ${Rbox} ${P}
+
+# fix MCPRINT all print 1 "$(step) ${T} $(v_MC_Ns[1]) $(v_MC_Ns[2]) $(v_MC_V:%.3f) $(v_MC_P:%.3f) $(c_pereal:%.3f) $(f_MC[1]) $(f_MC[2]) $(f_MC[5]) $(f_MC[6]) $(f_MC[7]) $(f_MC[8])" title "t T N1 N2 V P U Wc Ac Wsgc Asgc Wbox Abox" file ${data}/dmu$(v_dmu:%.3f).dat screen no
+
+# dump MCDUMP MC_include custom 10 ${data}/dmu$(v_dmu:%.3f).dump id type x y z c_peatom
+
+run ${tequil}
+
+reset_timestep 0
+
+fix MC all hgcmc ${T} ${seed} ${Nmd} mu ${mus} sgcmc ${Pswap} ${Nswap} ${Bswap} ${MCbox} ${Pbox} ${Rbox} ${P} print MCPRINT # dump MCDUMP
+
+fix MCPRINT all print 1 "$(step) ${T} ${dmu} $(v_MC_Ns[1]) $(v_MC_Ns[2]) $(v_MC_V:%.3f) $(v_MC_P:%.3f) $(lx:%.3f) $(ly:%.3f) $(lz:%.3f) $(c_pereal:%.3f) $(f_MC[1]) $(f_MC[2]) $(f_MC[5]) $(f_MC[6]) $(f_MC[7]) $(f_MC[8])" title "t T dmu N1 N2 V P Lx Ly Lz U Wc Ac Wsgc Asgc Wbox Abox" file ${data}/dmu$(v_dmu:%.3f).dat screen no
+
+run ${tsample}
+
+write_data ${data}/dmu$(v_dmu:%.3f).lmp

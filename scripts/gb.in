@@ -1,0 +1,62 @@
+include settings.in
+
+read_data ${lmp}
+
+pair_style hybrid/scaled 1. ${pair_style} 0. ${pair_style}
+pair_coeff * * ${pair_style} 1 ${pair_file} ${elements} NULL NULL
+pair_coeff * * ${pair_style} 2 ${pair_file} ${elements} ${elements}
+
+label LOOP
+variable type loop ${Ntypes}
+  mass ${type} ${mass}
+  next type
+  next mass
+  jump SELF LOOP
+
+change_box all x scale $(v_a/v_a0) remap
+change_box all y scale $(v_a/v_a0) remap
+change_box all z scale $(v_a/v_a0) remap
+
+replicate ${Nx} ${Ny} 1 bbox
+
+region INTERFACE block INF INF INF INF $(zlo + v_rcap) $(zhi - v_rcap) units box
+region BASE      block INF INF INF INF INF $(zlo + v_rcap) units box
+region CAP       block INF INF INF INF $(zhi - v_rcap) INF units box
+
+group TYPE1 type 1
+group CAP  region CAP
+group BASE region BASE
+group REAL subtract TYPE1 BASE CAP
+
+region LEFT  block INF $(xlo+lx/2) INF INF $(zlo+lz/2-3) $(zlo+lz/2+3) units box
+region RIGHT block $(xlo+lx/2) INF INF INF $(zlo+lz/2-3) $(zlo+lz/2+3) units box
+delete_atoms random count $(round(0.25*v_Nplane/2)) no all LEFT  ${seed}
+delete_atoms random count $(round(0.75*v_Nplane/2)) no all RIGHT ${seed}
+delete_atoms overlap 0.5 all all
+
+fix SF1 CAP  setforce 0 0 0
+fix SF2 BASE setforce 0 0 0
+min_style cg
+minimize 0 1e-8 1000 1000
+unfix SF1
+unfix SF2
+
+displace_atoms REAL random 0.2 0.2 0.2 ${seed}
+
+create_atoms 3 random ${Nfict} ${seed} INTERFACE overlap 0.1
+
+group FICT type 3
+
+if "$(v_mu2 == -999.) || $(!is_defined(variable,mu2) && is_defined(variable,pswap))" then &
+  "variable pgc   equal $(v_pgc/(1-v_pswap))" &
+  "variable pxy   equal $(v_pxy/(1-v_pswap))" &
+  "variable pz    equal $(v_pz/(1-v_pswap))" &
+  "variable pswap equal 0."
+
+fix GGCMC REAL hgcmc ${T} ${seed} ${tmd} sgcmc ${pswap} 1 ${Bswap} gcmc FICT ${pgc} ${tgc} ${Bins} ${Bdel} cap BASE CAP ${pxy} ${rxy} ${pz} ${rz} ${P} mu ${mu1} ${mu2} print MCPRINT dump MCDUMP
+
+fix MCPRINT all print 1 "$(step) ${T} ${mu1} ${mu2} $(v_MC_Ns[1]) $(v_MC_Ns[2]) $(v_MC_V:%.3f) $(v_MC_P:%.3f) $(c_pereal:%.3f) $(f_GGCMC[1]) $(f_GGCMC[2]) $(f_GGCMC[3]) $(f_GGCMC[4]) $(f_GGCMC[5]) $(f_GGCMC[6]) $(f_GGCMC[7]) $(f_GGCMC[8])" title "t T mu1 mu2 N1 N2 V P U Nc Ac Ngc Agc Nsgc Asgc Nbox Abox" file ${name}.dat screen no
+
+dump MCDUMP MC_include custom 100 ${name}.dump id type x y z c_peatom
+
+run ${tsample}

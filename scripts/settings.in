@@ -1,0 +1,47 @@
+include ../../potential.in
+
+boundary    p p s
+units       metal
+timestep    0.002
+
+variable    seed equal 42
+
+### thermodynamic variables ###
+variable    mu1     world ${mu1s}
+variable    mu2     world ${mu2s}
+variable    name    string "mu$(v_mu2:%.3f)"
+
+variable    a       world ${as}
+variable    a0      equal 3.
+#variable    C       world ${CS}
+#variable    C0      equal sqrt(8/3)
+
+
+### Structure ###
+variable          lmp  string "../gb.lmp"
+variable          Rcap equal 6
+
+variable Nx       equal 10
+variable Ny       equal 5
+variable Nplane   equal 1*v_Nx*v_Ny
+
+### MC settings ###
+variable Pswap   equal 0.9
+variable Pgc     equal 0.05
+variable Pxy     equal 0.0025
+variable Pz      equal 0.0025
+
+variable Ngc     equal 200
+variable Nmd     equal 50
+
+variable Bins    equal 5*v_temp
+variable Bdel    equal 1*v_temp
+variable Bswap   equal 3*v_temp
+
+variable Rxy     equal 0.02
+variable Rz      equal 0.1
+variable press   equal 0.
+
+variable Nfict   equal count(REAL)
+
+variable Nsample equal round(1e8)

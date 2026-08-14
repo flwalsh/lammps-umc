@@ -1,0 +1,16 @@
+include ${input}/defaults.in
+include settings.in
+
+# create phase
+include ${input}/${phase}.in
+
+# equilibrate volume under P0, Ti
+#variable T equal ${Ti}
+#include ${input}/average_volume.in
+
+# variable $MU parallelized across partition
+
+include ${input}/sgcmc.in
+
+# 13s vs 9s
+# 25s vs 18s

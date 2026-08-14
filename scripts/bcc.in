@@ -1,0 +1,23 @@
+variable Nlat equal round((v_Natoms/2)^(1/3))
+lattice bcc ${a0}
+region boxregion block 0 ${Nlat} 0 ${Nlat} 0 ${Nlat}
+create_box ${Ntypes} boxregion
+create_atoms 1 box
+
+# kinda dumb but necessary I think
+label LOOP
+variable type loop ${Ntypes} 
+  mass ${type} ${mass}
+  next type
+  next mass
+  jump SELF LOOP
+
+variable lx0 equal $(lx)
+variable lz0 equal $(lz)
+
+variable a equal lx/v_lx0*v_a0
+variable c equal lz/v_lz0*v_a0
+
+variable CNAcut equal 1/2*(sqrt(2)+1)*v_a
+
+variable reference string "einstein"

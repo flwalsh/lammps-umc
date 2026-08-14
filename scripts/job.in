@@ -1,0 +1,26 @@
+#!/bin/bash
+
+LAMMPS="/path/to/lammps"
+
+NPART=14
+NPROC=112
+
+INPUT="/path/to/scripts/"
+
+TEMP=1400
+XS=$(seq 0.050 0.020 0.310)
+
+DATA=$(grep -w "${XS}" /path/to/sgcmc)
+AS=$(echo "${DATA}" | cut -d' ' -f2)
+MU1S=$(echo "${DATA}" | cut -d' ' -f5)
+MU2S=$(echo "${DATA}" | cut -d' ' -f6)
+
+echo "${DATA}" > thermo.dat
+
+srun -n ${SLURM_NTASKS} ${LAMMPS} -in ${INPUT}/gb.in \
+  -partition ${NPART}x${NPROC} \
+  -var temp ${TEMP} \
+  -var as "${AS}" \
+  -var mu1s "${MU1S}" \
+  -var mu2s "${MU2S}" \
+  -screen none -nonbuf

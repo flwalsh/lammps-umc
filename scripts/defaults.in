@@ -1,0 +1,26 @@
+variable k_B      equal 8.617333262e-5 # eV/K
+variable Ntypes   equal 1
+
+variable barostat string "iso"
+
+variable Tdamp    equal 100*dt
+variable Pdamp    equal 1000*dt
+
+variable tfreq   equal v_tsample
+variable tevery  equal 100
+variable trepeat equal round(v_tfreq/v_tevery) # delayed evlauation
+
+### active learning
+
+units metal
+dimension 3
+boundary p p p
+atom_style atomic
+timestep 0.001
+
+### overrideable variables ###
+
+# index alloys to be overwritten by command line
+variable settings index "settings.in"
+variable seed     index 42
+variable dir      index "."
