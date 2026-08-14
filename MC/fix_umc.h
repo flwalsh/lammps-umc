@@ -99,8 +99,6 @@ class FixUMC : public Fix {
   int atom_swap_nmax;
   double beta, beta_insert, beta_delete, beta_md, beta_sg;
 
-  // force-biased velocities; tvbias = 0 disables
-  double tvbias, rvbias, tbiascap, bias_logfwd;
   double pereal_stored;
   double virial_stored;    // trace of the real-group virial, captured when it is tallied
   double virialz_stored;   // its zz component
@@ -145,7 +143,6 @@ class FixUMC : public Fix {
   void initiate_sgcmc();
   void set_hybrid_lambda(double new_lambda);
   void initiate_velocities();
-  double velocity_bias(int draw);
   void store_pe();
   void store_ke();
 
