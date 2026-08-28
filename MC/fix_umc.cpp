@@ -1,0 +1,2051 @@
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   https://www.lammps.org/, Sandia National Laboratories
+   LAMMPS development team: developers@lammps.org
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------
+   Contributing authors: Flynn Walsh
+------------------------------------------------------------------------- */
+
+#include "fix_umc.h"
+#include "atom.h"
+#include "input.h" // for variable
+#include "integrate.h" // for ev_set
+#include "variable.h" // for variable
+#include "output.h" // for write_dump
+#include "dump.h" // for id
+#include "atom_vec.h"
+#include "comm.h"
+#include "compute.h"
+#include "domain.h"
+#include "error.h"
+#include "fix.h"
+#include "force.h"
+#include "group.h"
+#include "memory.h"
+#include "modify.h"
+#include "neighbor.h"
+#include "pair.h"
+#include "pair_hybrid_scaled.h"
+#include "random_park.h"
+#include "timer.h"
+#include "update.h"
+
+#include <cctype>
+#include <cfloat>
+#include <cmath>
+#include <cstring>
+
+#include "math_const.h"
+
+using namespace LAMMPS_NS;
+using namespace FixConst;
+
+/* ---------------------------------------------------------------------- */
+
+FixUMC::FixUMC(LAMMPS *lmp, int narg, char **arg) :
+    Fix(lmp, narg, arg),
+    type_stored(nullptr), mask_stored(nullptr), tag_stored(nullptr), image_stored(nullptr), x_stored(nullptr),
+    groupname(nullptr), fictgroupname(nullptr), caplogroupname(nullptr), caphigroupname(nullptr),
+    pair_style_name(nullptr), lambda_var(-1),
+    swaptypes(nullptr), typegrid(nullptr), typecount(nullptr), mu(nullptr), lambda3(nullptr),
+    random_equal(nullptr), random_unequal(nullptr),
+    c_peatom(nullptr), c_pereal(nullptr), c_keatom(nullptr),
+    print_nevery(0), print_count(0), print_fp(nullptr), revtest_fp(nullptr), print_text(nullptr), print_copy(nullptr),
+    print_work(nullptr), print_maxcopy(0), print_maxwork(0), mcdumpid(nullptr),
+    plocal(nullptr)
+{
+  if (narg < 6) error->all(FLERR, "Illegal fix UMC command nargs");
+
+  dynamic_group_allow = 1;
+  time_integrate = 1;
+
+  vector_flag = 1;
+  size_vector = 8; // for MC statistics outputs
+  global_freq = 1;
+  extvector = 0;
+ 
+  nrealtypes = -1;
+  tgc = -1;
+  tsgc = -1;
+  ntrialsmax = 0;   // 0 = run to the step budget, ramp on the expected trial count
+  zswap = 0.0;
+  bridgetype = -1;
+  memory->create(mu, atom->ntypes+1, "umc:mu"); // +1 b/c 1-indexed
+  memory->create(mu0, atom->ntypes+1, "umc:mu0");
+  memory->create(muend, atom->ntypes+1, "umc:muend");
+  for (int itype = 0; itype <= atom->ntypes; itype++)
+    mu[itype] = mu0[itype] = muend[itype] = NAN;
+  memory->create(swaptypes, atom->ntypes, "umc:swaptypes"); // 0-indexed
+
+  fictbit = 0;
+
+  groupname = utils::strdup(arg[1]); // fix group (igroup, groupbit) = real atoms
+  // create move group for particles with velocities
+  group->assign(fmt::format("MC_move union {}",groupname));
+  int imovegroup = group->find("MC_move");
+  movebit = group->bitmask[imovegroup];
+
+  double temperature = utils::numeric(FLERR, arg[3], false, lmp);
+  int seed = utils::inumeric(FLERR, arg[4], false, lmp);
+  tc = utils::inumeric(FLERR, arg[5], false, lmp);
+
+  if (seed <= 0) error->all(FLERR, "Illegal fix UMC seed");
+  if (temperature <= 0.0) error->all(FLERR, "Illegal fix UMC temperature");
+  if (tc <= 0) error->all(FLERR, "Illegal fix UMC trajectory length");
+
+  beta = 1.0 / (force->boltz * temperature);
+  beta_insert = beta;
+  beta_delete = beta;
+  beta_md = beta;
+  beta_sg = 0;
+
+  options(narg - 6, &arg[6]);
+  if ((pgc > 0. || psgc > 0.) && !atom->tag_enable) error->all(FLERR, "Fix UMC requires atom IDs for GC/SGC moves");
+
+  // box_change gates reset_box comm setup and neighbor bins in Verlet and reneighbor
+  // without it accepted box moves leave bins and comm cutoffs pinned to the original box
+  if (piso > 0. || paniso > 0.) box_change |= Fix::BOX_CHANGE_SIZE;   // iso/aniso resize x,y,z
+  if (pzcap > 0.) box_change |= Fix::BOX_CHANGE_Z;                    // zcap stretches z only
+
+  // global array rows are real species
+  // cols 1-2 back MC_N<i>/MC_mu<i> from typecount/mu
+  // cols 3-6 expose stored PE virial and real count for MC_U/MC_P/MC_Pz without mid-burst computes
+  array_flag = 1;
+  size_array_rows = nrealtypes;
+  size_array_cols = 6;
+  extarray = 0;
+
+  // validate pre-compute inputs first so bad commands leave compute IDs reusable
+  if (tgc > 0 || tsgc > 0) {
+    PairHybridScaled *hybrid = dynamic_cast<PairHybridScaled *>(force->pair);
+    if (!hybrid) error->all(FLERR,"pair_style hybrid/scaled required for gradual gc/sgc");
+    lambda_var = input->variable->find("lambda");
+    if (lambda_var < 0)
+      error->all(FLERR, "Variable lambda must exist for gradual gc/sgc in fix UMC");
+    if (!input->variable->internalstyle(lambda_var))
+      error->all(FLERR, "Variable lambda must be internal-style for gradual gc/sgc in fix UMC");
+  }
+  if (fictgroupname && strcmp(groupname,"all") == 0)
+    error->all(FLERR, "UMC fix group cannot be 'all' with fictitious particles.");
+
+  // create computes for real group (fix group) before any dependent computes
+  c_keatom = modify->add_compute("keatom all ke/atom");
+  c_kereal = modify->add_compute(fmt::format("kereal {} reduce sum c_keatom",groupname));
+
+  c_peatom = modify->add_compute("peatom all pe/atom");
+  c_pereal = modify->add_compute(fmt::format("pereal {} reduce sum c_peatom",groupname));
+
+  c_patom  = modify->add_compute(fmt::format("patom {} stress/atom NULL pair",groupname));
+  c_preal  = modify->add_compute(fmt::format("preal {} reduce sum c_patom[1] c_patom[2] c_patom[3]",groupname));
+
+  // lots of extra initialization for gcmc
+  if (fictgroupname) {
+    // fict group settings
+    ifictgroup = group->find(fictgroupname);
+    if (ifictgroup < 0) error->all(FLERR, "Unknown fix UMC group {}", fictgroupname);
+    fictbit = group->bitmask[ifictgroup];
+
+    // add fictitious particle to move group
+    group->assign(fmt::format("MC_move union MC_move {}",fictgroupname));
+
+    // neigh_modify include to avoid calculating energies for fictitious particles when not necessary
+    if (atom->firstgroupname) error->warning(FLERR, "UMC must replace {} as include group for internal use.",atom->firstgroupname);
+    input->one(fmt::format("atom_modify first {}",groupname));
+    input->one(fmt::format("neigh_modify include {}",groupname));
+    
+    // also exclude fict-fict interactions when calculating fictitious energies
+    input->one(fmt::format("neigh_modify exclude group {} {}",fictgroupname,fictgroupname));
+  }
+  if (cap) {
+    // subtract cap particles from move group
+    group->assign(fmt::format("MC_move subtract MC_move {} {}",caplogroupname,caphigroupname));
+  }
+  
+  // create \Lambda^3 for each species
+  if (pgc > 0. || psgc > 0.) {
+    memory->create(lambda3, nrealtypes+1, "umc:lambda3"); // +1 b/c 1-indexed
+    double lambda;
+    for (int itype=1; itype<=nrealtypes; itype++) {
+      lambda = sqrt( force->hplanck * force->hplanck * beta / (2.0*MathConst::MY_PI * atom->mass[itype] * force->mvv2e) );
+      lambda3[itype] = lambda * lambda * lambda;
+      if (comm->me == 0) utils::logmesg(lmp,"itype = {}, mass = {}, lambda = {}, lambda3 = {}\n",itype,atom->mass[itype],lambda,lambda3[itype]);
+    }
+  }
+ 
+  // create type counter - easier to track than repeatedly invoking compute->count_types
+  memory->create(typecount, nrealtypes+1, "umc:typecount"); // +1 b/c 0 is fict
+  bigint *typecountlocal;
+  memory->create(typecountlocal, nrealtypes+1, "umc:typecountlocal"); // +1 b/c 0 is fict
+  for (int itype=0; itype<=nrealtypes; itype++) {
+    typecountlocal[itype] = 0;
+  }
+  // count real diagonal and optional fict tier from typegrid bounds so other initial types are bridges
+  int fictlo = (tgc > -1) ? typegrid[0][1] : 0;
+  int ficthi = (tgc > -1) ? typegrid[0][nrealtypes] : -1;
+  int itype;
+  for (int i = 0; i < atom->nlocal; i++) {
+    if (atom->mask[i] & movebit) { // count both real and fict
+      itype = atom->type[i];
+      if (itype <= nrealtypes) typecountlocal[itype]++;
+      else if (itype >= fictlo && itype <= ficthi) typecountlocal[0]++;
+      else error->all(FLERR, "Bridge types are not allowed in the initial configuration for fix_umc");
+    }
+  }
+  MPI_Allreduce(typecountlocal,typecount,nrealtypes+1,MPI_LMP_BIGINT,MPI_SUM,world);
+  memory->destroy(typecountlocal);
+
+  if (tgc > -1 && typecount[0] == 0)
+    error->all(FLERR, "GC requires fictitious particles in fictitious types for fix_umc");
+    
+  for (int itype=0; itype<=nrealtypes; itype++) {
+    if (comm->me == 0) utils::logmesg(lmp,"itype = {}, typecount = {}\n",itype,typecount[itype]);
+  }
+  
+  // random number generator, same for all procs
+  random_equal = new RanPark(lmp, seed);
+  random_unequal = new RanPark(lmp, seed+comm->me);
+
+  pereal_stored = virial_stored = virialz_stored = 0.0;   // real values land in setup()
+
+  nmax_stored = 0;
+  atom_swap_nmax = 0;
+  
+  laststep = update->ntimestep;
+
+  // set comm size needed by this Fix
+  if (atom->q_flag) error->all(FLERR, "Charge not yet supported by UMC.");
+  if (atom->q_flag) comm_forward = 2;
+  else comm_forward = 1;
+}
+
+/* ---------------------------------------------------------------------- */
+
+FixUMC::~FixUMC()
+{
+  memory->destroy(mu);
+  memory->destroy(mu0);
+  memory->destroy(muend);
+  memory->destroy(swaptypes);
+  memory->destroy(typegrid);
+  memory->destroy(typecount);
+  memory->destroy(lambda3);
+ 
+  delete random_equal;
+  delete random_unequal;
+
+  memory->sfree(image_stored);
+  memory->sfree(mask_stored);
+  memory->sfree(tag_stored);
+  memory->sfree(type_stored);
+  memory->sfree(x_stored);
+  memory->sfree(plocal);
+
+  modify->delete_compute("keatom");
+  modify->delete_compute("kereal");
+  modify->delete_compute("peatom"); 
+  modify->delete_compute("pereal");
+  modify->delete_compute("patom");
+  modify->delete_compute("preal");
+  
+  // undo fict-tier neighbor settings without input commands because teardown may already be underway
+  if (fictgroupname) {
+    if (neighbor) {
+      neighbor->includegroup = 0;
+      neighbor->exclusion_group_group_delete(ifictgroup, ifictgroup);
+    }
+    if (atom) {
+      delete[] atom->firstgroupname;
+      atom->firstgroupname = nullptr;
+    }
+  }
+
+  // null-safe cleanup and rank-0-only file handles
+  delete[] groupname;
+  delete[] fictgroupname;
+  delete[] pair_style_name;
+  delete[] caphigroupname;
+  delete[] caplogroupname;
+  delete[] mcdumpid;
+  delete[] print_text;
+  memory->sfree(print_copy);
+  memory->sfree(print_work);
+  if (print_fp) fclose(print_fp);
+  if (revtest_fp) fclose(revtest_fp);
+}
+
+/* ----------------------------------------------------------------------
+   parse optional parameters at end of input line
+------------------------------------------------------------------------- */
+void FixUMC::options(int narg, char **arg)
+{
+  if (narg < 0) error->all(FLERR, "Illegal fix UMC command");
+
+  pgc = 0.; psgc = 0; phop = 0; pxycap = 0; pzcap = 0.; piso = 0; paniso = 0;
+  nswaptypes = 0;
+  
+  revtest = 0;
+  reverse = 0;
+  trial = 0;
+  imcdump = -1;
+  npefict_dumps = 0;
+  cap = 0;
+  press = 0.;
+
+  int iarg = 0;
+  while (iarg < narg) {
+    if (strcmp(arg[iarg], "pair_style") == 0) {
+      if (iarg + 2 > narg) error->all(FLERR, "Illegal pair_style in fix_umc");
+      if (pair_style_name) error->all(FLERR, "Pair style already set in fix_umc");
+      pair_style_name = utils::strdup(arg[iarg+1]);
+      iarg += 2;
+    }
+    else if (strcmp(arg[iarg], "mu") == 0) {
+      // mu <mu1> ... <mun> one value or NULL per real species with list length defining nrealtypes
+      if (nrealtypes != -1) error->all(FLERR, "mu given twice in fix_umc");
+      int n = 0;
+      while (iarg + 1 + n < narg &&
+             (strcmp(arg[iarg+1+n],"NULL") == 0 || utils::is_double(arg[iarg+1+n]))) n++;
+      if (n < 1) error->all(FLERR, "Illegal mu arg length in fix_umc");
+      if (n > atom->ntypes) error->all(FLERR, "More mu values than atom types in fix_umc");
+      nrealtypes = n;
+      for ( int itype=1; itype <= nrealtypes; itype++) {
+        if (strcmp(arg[iarg+itype],"NULL") == 0) mu[itype] = NAN;
+        else {
+          mu[itype] = utils::numeric(FLERR, arg[iarg+itype], false, lmp);
+          swaptypes[nswaptypes] = itype;
+          nswaptypes++;
+        }
+      }
+      iarg += nrealtypes + 1;
+    }
+    else if (strcmp(arg[iarg], "muend") == 0) {
+      // muend <e1> ... <en> one per real species with NULL meaning no ramp
+      // scan like mu so keyword order stays free
+      int n = 0;
+      while (iarg + 1 + n < narg &&
+             (strcmp(arg[iarg+1+n],"NULL") == 0 || utils::is_double(arg[iarg+1+n]))) n++;
+      if (n > atom->ntypes) error->all(FLERR, "More muend values than atom types in fix_umc");
+      for (int itype = 1; itype <= n; itype++)
+        if (strcmp(arg[iarg+itype],"NULL") != 0)
+          muend[itype] = utils::numeric(FLERR, arg[iarg+itype], false, lmp);
+      iarg += n + 1;
+    }
+    else if (strcmp(arg[iarg], "trials") == 0) {
+      // trials <N> end after exactly N trials and ramp mu over those N so paired legs see identical mu(k)
+      if (iarg + 2 > narg) error->all(FLERR, "Illegal trials in fix_umc");
+      ntrialsmax = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      if (ntrialsmax <= 0) error->all(FLERR, "Illegal trials count in fix_umc");
+      iarg += 2;
+    }
+    else if (strcmp(arg[iarg], "gc") == 0) {
+      if (iarg + 6 > narg) error->all(FLERR, "Illegal gc in fix_umc");
+      fictgroupname = utils::strdup(arg[iarg+1]);
+      pgc = utils::numeric(FLERR, arg[iarg+2], false, lmp);
+      tgc = utils::inumeric(FLERR, arg[iarg+3], false, lmp);
+      if (tgc <= 0) error->all(FLERR, "Illegal fix UMC GC trajectory length");
+      double T_insert = utils::numeric(FLERR, arg[iarg+4], false, lmp);
+      double T_delete = utils::numeric(FLERR, arg[iarg+5], false, lmp);
+      if (T_insert <= 0. || T_delete <= 0.) error->all(FLERR, "Illegal fix UMC GC temperature");
+      beta_insert = 1. / (force->boltz * T_insert);
+      beta_delete = 1. / (force->boltz * T_delete);
+      iarg += 6;
+    }
+    else if (strcmp(arg[iarg], "sgc") == 0) {
+      if (iarg + 4 > narg) error->all(FLERR, "Illegal sgc in fix_umc");
+      psgc = utils::numeric(FLERR, arg[iarg+1], false, lmp);
+      tsgc = utils::inumeric(FLERR, arg[iarg+2], false, lmp);
+      if (tsgc < 0) error->all(FLERR, "Illegal fix UMC SGC trajectory length");
+      if (strcmp(arg[iarg+3],"NULL") == 0) beta_sg = 0.;
+      else {
+        double T_sg = utils::numeric(FLERR, arg[iarg+3], false, lmp);
+        if (T_sg <= 0.) error->all(FLERR, "Illegal fix UMC SGC temperature");
+        beta_sg = 1. / (force->boltz * T_sg);
+      }
+      iarg += 4;
+    }
+    else if (strcmp(arg[iarg], "hop") == 0) {
+      error->all(FLERR, "hop moves are currently disabled in fix UMC");
+    }
+    else if (strcmp(arg[iarg], "cap") == 0) {
+      if (iarg + 8 > narg) error->all(FLERR, "Illegal cap in fix_umc");
+      cap = 1;
+      caplogroupname = utils::strdup(arg[iarg+1]);
+      icaplogroup = group->find(caplogroupname);
+      if (icaplogroup < 0) error->all(FLERR, "Unknown fix UMC group {}", caplogroupname);
+      caphigroupname = utils::strdup(arg[iarg+2]);
+      icaphigroup = group->find(caphigroupname);
+      if (icaphigroup < 0) error->all(FLERR, "Unknown fix UMC group {}", caphigroupname);
+      pxycap = utils::numeric(FLERR, arg[iarg+3], false, lmp);
+      xycapmax = utils::numeric(FLERR, arg[iarg+4], false, lmp);
+      pzcap = utils::numeric(FLERR, arg[iarg+5], false, lmp);
+      zcapmax = utils::numeric(FLERR, arg[iarg+6], false, lmp);
+      press  = utils::numeric(FLERR, arg[iarg+7], false, lmp);
+      iarg += 8;
+    }
+    else if (strcmp(arg[iarg], "iso") == 0) {
+      if (iarg + 4 > narg) error->all(FLERR, "Illegal iso in fix_umc");
+      piso   = utils::numeric(FLERR, arg[iarg+1], false, lmp);
+      isomax = utils::numeric(FLERR, arg[iarg+2], false, lmp);
+      press  = utils::numeric(FLERR, arg[iarg+3], false, lmp);
+      iarg += 4;
+    }
+    else if (strcmp(arg[iarg], "aniso") == 0) {
+      if (iarg + 4 > narg) error->all(FLERR, "Illegal aniso in fix_umc");
+      paniso   = utils::numeric(FLERR, arg[iarg+1], false, lmp);
+      anisomax = utils::numeric(FLERR, arg[iarg+2], false, lmp);
+      press  = utils::numeric(FLERR, arg[iarg+3], false, lmp);
+      iarg += 4;
+    }
+    else if (strcmp(arg[iarg], "print") == 0) {
+      if (iarg + 4 > narg) error->all(FLERR, "Illegal print in fix_umc");
+      print_nevery = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      if (print_nevery <= 0) error->all(FLERR, "Illegal print frequency in fix_umc");
+
+      if (comm->me == 0) {
+        print_fp = fopen(arg[iarg+2], "w");
+        if (print_fp == nullptr)
+          error->one(FLERR, "Cannot open fix UMC print file {}: {}", arg[iarg+2],
+                     utils::getsyserror());
+      }
+
+      print_text = utils::strdup(arg[iarg+3]);
+      print_maxcopy = strlen(print_text) + 1;
+      print_maxwork = print_maxcopy;
+      print_copy = (char *) memory->smalloc(print_maxcopy * sizeof(char), "UMC:print_copy");
+      print_work = (char *) memory->smalloc(print_maxwork * sizeof(char), "UMC:print_work");
+      iarg += 4;
+    }
+    else if (strcmp(arg[iarg], "dump") == 0) {
+      if (iarg + 2 > narg) error->all(FLERR, "Illegal dump in fix_umc");
+      mcdumpid = utils::strdup(arg[iarg+1]);
+      iarg += 2;
+    }
+    else if (strcmp(arg[iarg], "revtest") == 0) {
+      revtest = 1;
+      iarg++;
+    }
+    else {
+      if (comm->me == 0) utils::logmesg(lmp,"args = {}",arg[iarg]); 
+      error->all(FLERR, "Illegal fix_umc command (else)");
+    }
+  }
+
+  if (nrealtypes == -1) nrealtypes = atom->ntypes;   // no mu: no swap moves, every type is a species
+
+  // capture ramp anchors once here since init runs per run
+  // species without muend use mu0 and NULL species stay NaN
+  for (int itype = 0; itype <= atom->ntypes; itype++) {
+    mu0[itype] = mu[itype];
+    if (std::isnan(muend[itype])) muend[itype] = mu[itype];
+  }
+
+
+  // compact species-pair type grid with species 0 as NULL and 1..nrealtypes as real
+  // LAMMPS types encode ordered pairs across the two hybrid/scaled sub-styles
+  // layout is real diagonal optional fict tier optional sgc off-diagonals with no i->0 delete tier
+  // built after option parsing so gc/sgc can appear on either side of mu
+  {
+    int n = nrealtypes;
+    memory->create(typegrid, n+1, n+1, "hmc:typegrid");
+    for (int a = 0; a <= n; a++)
+      for (int b = 0; b <= n; b++) typegrid[a][b] = 0;
+
+    int t = 0;
+    // real home diagonal (i->i): data-file types 1..nrealtypes (lambda-invariant)
+    for (int i = 1; i <= n; i++) typegrid[i][i] = ++t;
+    // fict (0->j): insertion reservoir tier (gc)
+    if (tgc > -1) for (int j = 1; j <= n; j++) typegrid[0][j] = ++t;
+    // sgc off-diagonal i->j i!=j for gradual morph bridges only
+    if (tsgc > 0)
+      for (int i = 1; i <= n; i++)
+        for (int j = 1; j <= n; j++)
+          if (i != j) typegrid[i][j] = ++t;
+
+    if (t != atom->ntypes)
+      error->all(FLERR, "fix_umc type grid size {} != ntypes {} (nreal {} from mu, tiers: real{}{})",
+                 t, atom->ntypes, n, tgc > -1 ? " fict" : "", tsgc > 0 ? " sgc" : "");
+
+    // log the grid in type order with a startup-only inverse scan
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "UMC type grid (nreal={}, ntypes={}): ", n, atom->ntypes);
+      for (int tt = 1; tt <= atom->ntypes; tt++)
+        for (int a = 0; a <= n; a++)
+          for (int b = 0; b <= n; b++)
+            if (typegrid[a][b] == tt) utils::logmesg(lmp, "{}=({}->{}) ", tt, a, b);
+      utils::logmesg(lmp, "\n");
+    }
+    // no pair_coeff none plumbing because every grid cell has a non-NULL species in at least one sub-style
+  }
+
+  if ((tgc > 0 || tsgc > 0) && !pair_style_name)
+    error->all(FLERR, "pair_style must be set for gradual gc/sgc in fix_umc");
+      
+  if ((pgc > 0. || psgc > 0. || phop > 0. ) && nswaptypes == 0) error->all(FLERR, "Illegal gcmc in fix_umc; mu must be defined");
+
+  // sgc redraws newtype until it differs from oldtype so one swappable species is a config error
+  if (psgc > 0. && nswaptypes < 2)
+    error->all(FLERR, "fix UMC sgc requires at least two species with a mu value");
+ 
+  tmax = tc;
+  if (tsgc > tmax) tmax = tsgc;
+  if (tgc > tmax) tmax = tgc;
+
+  pc = 1. - pgc - psgc - phop - pxycap - pzcap - piso - paniso;
+
+  if (comm->me == 0) utils::logmesg(lmp,"pc = {}, sgcmc = {}, pgc = {}, phop = {}, pxycap = {}, pzcap = {}, piso = {}, paniso = {} \n",pc,psgc,pgc,phop,pxycap,pzcap,piso,paniso);
+  // probably need to make this more floating-point tolerant
+  if (pgc < 0. || psgc < 0. || phop < 0. || pc < 0. || pxycap < 0. || pzcap < 0. || piso < 0. || paniso < 0.) error->all(FLERR, "Illegal move probabilities < 0");
+}
+
+/* ---------------------------------------------------------------------- */
+
+int FixUMC::setmask()
+{
+  int mask = 0;
+  mask |= INITIAL_INTEGRATE;
+  mask |= FINAL_INTEGRATE; // for NVE
+  mask |= POST_INTEGRATE;
+  mask |= END_OF_STEP;
+  return mask;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// before each MD run: set internal flags
+void FixUMC::init()
+{
+  // so modify->setup calculates energies that can be stored
+  update->eflag_global = update->ntimestep;
+  update->eflag_atom = update->ntimestep;
+  
+  // from FixNVE
+  dtv = update->dt;
+  dtf = 0.5 * update->dt * force->ftm2v;
+
+  if (tgc > 0 || tsgc > 0) {
+    // re-resolve lambda every run because variable deletion can shift indices
+    lambda_var = input->variable->find("lambda");
+    if (lambda_var < 0)
+      error->all(FLERR, "Variable lambda must exist for gradual gc/sgc in fix UMC");
+    if (!input->variable->internalstyle(lambda_var))
+      error->all(FLERR, "Variable lambda must be internal-style for gradual gc/sgc in fix UMC");
+
+    set_hybrid_lambda(0.0);
+  }
+ 
+  // from FixAtomSwap::init with fict/bridge rows matching real rows for lambda=1 interactions
+  double **cutsq = force->pair->cutsq;
+  for (int itype = 1; itype <= atom->ntypes; itype++)
+    for (int jtype = 1; jtype <= atom->ntypes; jtype++)
+      for (int ktype = 1; ktype <= nrealtypes; ktype++)
+        if (cutsq[itype][ktype] != cutsq[jtype][ktype])
+          error->all(FLERR, "Unequal cutoffs not yet supported");
+}
+
+// before each MD run calculate forces and setup
+void FixUMC::setup(int flag)
+{
+  nmd_trials = nmd_accepts = ninsertion_trials = ninsertion_accepts = ndeletion_trials = ndeletion_accepts = nsgc_trials = nsgc_accepts = niso_trials = niso_accepts = naniso_trials = naniso_accepts = nxycap_trials = nxycap_accepts = nzcap_trials = nzcap_accepts = 0;
+  npefict_dumps = 0;
+  
+  if (!atom->mass) error->all(FLERR, "Fix UMC requires per atom type masses");
+
+  // if GCMC
+  if (tgc > 0 || tsgc > 0) {
+    set_hybrid_lambda(0.0);
+  }
+  
+  if (cap == 1) {
+    double zcaplo_local = domain->boxlo[2];
+    double zcaphi_local = domain->boxhi[2];
+    
+    // find local group high/low
+    for (int i = 0; i < atom->nlocal; i++) {
+      if (atom->mask[i] & group->bitmask[icaplogroup] && atom->x[i][2] > zcaplo_local)  zcaplo_local = atom->x[i][2];
+      if (atom->mask[i] & group->bitmask[icaphigroup] && atom->x[i][2] < zcaphi_local)  zcaphi_local = atom->x[i][2];
+    }
+    
+    MPI_Allreduce(&zcaplo_local,&zcaplo,1,MPI_DOUBLE,MPI_MAX,world);
+    MPI_Allreduce(&zcaphi_local,&zcaphi,1,MPI_DOUBLE,MPI_MIN,world);
+
+    if (comm->me == 0) utils::logmesg(lmp,"MPI{}: zcaplo = {}, zcaphi = {}\n",comm->me,zcaplo,zcaphi);
+  }
+
+  // set internal variables now
+  double volume;
+  if (cap == 1) volume = domain->xprd * domain->yprd * (zcaphi - zcaplo);
+  else volume = domain->xprd * domain->yprd * domain->zprd;
+  input->one("variable MC_V internal 0.");
+  i_MC_V = input->variable->find("MC_V");
+  input->variable->internal_set(i_MC_V,volume);
+  
+  // create MC_A once because vector-style redefinition can leave dangling Variable data
+  if (input->variable->find("MC_A") < 0)
+    input->one(fmt::format("variable MC_A vector f_{}",id));
+
+  // per-species N and mu are equal-style so each print substitution sees the current instant-trial state
+  for (int itype = 1; itype <= nrealtypes; itype++) {
+    input->one(fmt::format("variable MC_N{} equal f_{}[{}][1]",itype,id,itype));
+    input->one(fmt::format("variable MC_mu{} equal f_{}[{}][2]",itype,id,itype));
+  }
+
+  // MC_U MC_P and MC_Pz read stored PE and virial because instant moves may not have a valid per-atom virial
+  input->one(fmt::format("variable MC_U equal f_{}[1][3]",id));
+
+  input->one(fmt::format("variable MC_P equal -f_{}[1][4]/(3*v_MC_V)+f_{}[1][6]/(v_MC_V)*{}",id,id,force->nktv2p/beta));
+
+  input->one(fmt::format("variable MC_Pz equal -f_{}[1][5]/v_MC_V+f_{}[1][6]/(v_MC_V)*{}",id,id,force->nktv2p/beta));
+
+  // setup dumping
+  if (mcdumpid) {
+    // clear before re-searching because dumps can be deleted or redefined between setup calls
+    imcdump = -1;
+    for (int idump=0; idump<output->ndump; idump++) {
+      if (strcmp(mcdumpid,output->dump[idump]->id) == 0) {
+        imcdump = idump;
+        break;
+      }
+    }
+    if (imcdump == -1) error->all(FLERR,"dump index not found");
+    if (comm->me == 0) utils::logmesg(lmp,"dump[{}] = {}, ndump = {}\n",imcdump,output->dump[imcdump]->id,output->ndump);
+  }
+
+  // re-anchor to this run so a previous trials timeout cannot leave laststep past the next run start
+  laststep = update->ntimestep;
+  trial = 0;
+  reverse = 0;
+
+  // fresh ramp for this run block: the anchor is mu0, captured once in options()
+  ntrialsdone = 0;
+  for (int itype = 1; itype <= nrealtypes; itype++) mu[itype] = mu0[itype];
+
+  // with trials the first trial is mu0 and the Nth is muend
+  // otherwise use the expected trial count from the step budget
+  if (ntrialsmax > 1) mustep = 1. / (double) (ntrialsmax - 1);
+  else if (update->endstep > update->beginstep)   // else `run 0`: inf would make every mu NaN
+    mustep = (pc*tc + psgc*(tsgc > 0 ? tsgc : 0) + pgc*(tgc > 0 ? tgc : 0))
+             / (double) (update->endstep - update->beginstep);
+  else mustep = 0.;
+
+  // storing before next move so on same step as energy computed
+  store_pe();
+  store_atom();
+}
+
+/* ----------------------------------------------------------------------
+   latch mu for the trial being armed
+   once per trial not per timestep
+   selection bias density ratio and e_diff all read one value
+   species with muend == mu0 and NULL species need no special case
+------------------------------------------------------------------------- */
+void FixUMC::update_mu()
+{
+  double f = ntrialsdone * mustep;
+  if (f > 1.) f = 1.;   // only reachable without `trials`, where mustep is an estimate
+
+  for (int itype = 1; itype <= nrealtypes; itype++)
+    mu[itype] = mu0[itype] + f * (muend[itype] - mu0[itype]);
+
+  ntrialsdone++;
+}
+
+/* ----------------------------------------------------------------------
+   trials was given but the run ended first
+   refuse legs where the ramp never reached muend
+------------------------------------------------------------------------- */
+void FixUMC::post_run()
+{
+  if (ntrialsmax == 0) return;
+
+  // force_timeout() zeroes the timer for good, so without this every later run exits at once
+  timer->reset_timeout();
+
+  if (ntrialsdone < ntrialsmax)
+    error->all(FLERR, "fix UMC ran out of timesteps after {} of {} trials",
+               ntrialsdone, ntrialsmax);
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+void FixUMC::set_hybrid_lambda(double new_lambda)
+{
+  constexpr double eps = 1.0e-12;
+
+  if (new_lambda < -eps || new_lambda > 1.0 + eps)
+    error->all(FLERR, "Fix UMC lambda must be between 0 and 1");
+
+  // read current lambda before early-out so caller assumptions cannot desync variable and pair style
+  double old_lambda = input->variable->compute_equal(lambda_var);
+
+  if (fabs(old_lambda) < eps) old_lambda = 0.0;
+  else if (fabs(old_lambda - 1.0) < eps) old_lambda = 1.0;
+  if (fabs(new_lambda) < eps) new_lambda = 0.0;
+  else if (fabs(new_lambda - 1.0) < eps) new_lambda = 1.0;
+
+  if (new_lambda == 0.0 || old_lambda == 0.0) {
+    char pair[] = "pair", one[] = "1", two[] = "2", compute[] = "compute", yes[] = "yes", no[] = "no";
+    char *args1[] = {pair, pair_style_name, one, compute, yes};
+    char *args2[] = {pair, pair_style_name, two, compute, new_lambda == 0.0 ? no : yes};
+    force->pair->modify_params(5,args1);
+    force->pair->modify_params(5,args2);
+  }
+
+  // Synchronize the endpoint compute flags even when lambda is already zero.
+  if (new_lambda == old_lambda) return;
+
+  input->variable->internal_set(lambda_var, new_lambda);
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+void FixUMC::initial_integrate(int /*vflag*/)
+{
+  bigint step = update->ntimestep;
+
+  // The MC dump fires on accepted trajectories, not its own timestep schedule.
+  // Park it after the run on every step because Output reschedules after a write.
+  if (imcdump > -1) output->next_dump[imcdump] = update->laststep + 1;
+
+  // time for a new move with tmax the longest newly armed move
+  if (step == laststep + 1) {
+    if (ntrialsmax > 0 && ntrialsdone >= ntrialsmax) {
+      // trial budget spent and no move active
+      // stop before arming another move or advancing stale lambda
+      timer->force_timeout();
+      trial = 0;
+      laststep = update->laststep + 1;
+      return;
+    }
+    else if (revtest && trial != 0 && !reverse) {
+      // revtest: reverse the forward trajectory move (GC or SGC) just completed; same atom
+      reverse = 1;
+      if (comm->me == 0) utils::logmesg(lmp,"performing reverse for revtest (trial = {})\n",trial);
+      if (trial == 2) {
+        initiate_sgcmc();
+        laststep = step + tsgc - 1;
+      } else {
+        trial *= -1;
+        if (trial == -1) initiate_deletion();
+        else if (trial == 1) initiate_insertion();
+        else error->all(FLERR,"trial != +/-1");
+        laststep = step + tgc - 1;
+      }
+    } else if (update->laststep - step + 1 < tmax) {
+      // fill the run tail with shortened NVE trials so gradual moves cannot strand atoms past the final timestep
+      trial = 0;
+      laststep = step + tc - 1;
+      if (laststep > update->laststep) laststep = update->laststep;
+      nmd_trials++;
+
+      // these are trials too, and they never reach the selection loop, so re-arm mu here as well
+      update_mu();
+    } else {
+    reverse = 0;
+
+    // initially try non-MD moves within loop
+    double p = -1.;
+    double pnow = pxycap + pzcap + piso + paniso + psgc + phop;
+    
+    while (p < pnow) {
+      // end the burst on trial N exactly
+      // breaking would reuse p below and arm an extra NVE trial outside update_mu
+      if (ntrialsmax > 0 && ntrialsdone >= ntrialsmax) {
+        timer->force_timeout();
+        trial = 0;
+        laststep = update->laststep + 1;
+        return;
+      }
+
+      // latch mu at trial start with one loop iteration equal to one trial of any kind
+      // gradual moves keep that value for the whole ramp and acceptance
+      update_mu();
+
+      p = random_equal->uniform();
+      trial = 0; // need to set as default
+      if (comm->me == 0) utils::logmesg(lmp,"\nt = {}, p = {:.3f}\n",step,p);
+
+      double pthresh = 0;
+      if (p < (pthresh += pxycap) ) trial_xycap();
+      else if (p < (pthresh += pzcap) ) trial_zcap();
+      else if (p < (pthresh += piso) ) trial_box(-1);
+      else if (p < (pthresh += paniso/3) ) trial_box(0);
+      else if (p < (pthresh += paniso/3) ) trial_box(1);
+      else if (p < (pthresh += paniso/3) ) trial_box(2);
+      else if (p < (pthresh += psgc) ) {
+        if (tsgc > 0) {
+          trial = 2;
+          initiate_sgcmc();
+          p = pnow;
+        } else {
+          trial_sgcmc();
+          store_atom();
+        }
+      }
+      else if (p < (pthresh += phop) ) {
+        // hop moves removed pending rework of their type conventions (see git history)
+        error->all(FLERR, "hop moves are currently disabled in fix UMC");
+      }
+
+      if (p < pnow) print();   // an instant move is a completed trial; end_of_step logs the rest
+
+      if (step == update->laststep) break; // exit while loop if SGCMC run 0
+    }
+      
+    // select the remaining NVE/GC band directly from pnow because pthresh depends on the instant-move branch
+    if (trial == 2) {
+      laststep = step + tsgc-1;
+    }
+    else if (p < pnow + pc) {
+      laststep = step + tc - 1;
+      nmd_trials++;
+    }
+    else if (p < pnow + pc + pgc) {
+      if (p < pnow + pc + pgc/2) trial = 1;
+      else trial = -1;
+      if (trial == -1) initiate_deletion();
+      else if (trial == 1) initiate_insertion();
+      else error->all(FLERR,"trial != +/-1");
+      laststep = step + tgc-1;
+    }
+    else error->all(FLERR, "Move selection probability messed up");
+    } // end normal selection (else of revtest reverse)
+
+    // we assume updated energies, neighbor lists at this point
+    initiate_velocities();
+    store_ke();
+ 
+    modify->clearstep_compute(); // sets invoked flag to 0
+    c_peatom->addstep(laststep);
+  }
+
+  // update lambda from trial position not accumulated increments so long ramps land exactly at 0 or 1
+  if (trial != 0) {
+    bigint tramp = (trial == 2) ? tsgc : tgc;
+    double g = (double) (step - laststep + tramp) / (double) tramp;
+    set_hybrid_lambda(trial == -1 ? 1.0 - g : g);
+  }
+    
+  // FixNVE::initial_integrate | easier than managing order of separate fix
+  double dtfm;
+  double **x = atom->x;
+  double **v = atom->v;
+  double **f = atom->f;
+  double *mass = atom->mass;
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+ 
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & movebit) {
+      if (mask[i] & groupbit) {
+
+        dtfm = dtf / mass[type[i]];
+        v[i][0] += dtfm * f[i][0];
+        v[i][1] += dtfm * f[i][1];
+        v[i][2] += dtfm * f[i][2];
+      }
+
+      x[i][0] += dtv * v[i][0];
+      x[i][1] += dtv * v[i][1];
+      x[i][2] += dtv * v[i][2];
+    }
+  }
+  
+}
+
+// if cap, fix wall/reflect behavior
+void FixUMC::post_integrate()
+{
+  if (cap != 1) return;
+
+  double **x = atom->x;
+  double **v = atom->v;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & movebit) {
+      if (x[i][2] < zcaplo) {
+        x[i][2] = zcaplo + (zcaplo - x[i][2]);
+        v[i][2] *= -1;
+      } else if (x[i][2] > zcaphi) {
+        x[i][2] = zcaphi - (x[i][2] - zcaphi);
+        v[i][2] *= -1;
+      }
+    }
+  }
+}
+
+void FixUMC::final_integrate()
+{
+  // FixNVE::final_integrate
+  double dtfm;
+  double **v = atom->v;
+  double **f = atom->f;
+  double *mass = atom->mass;
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  for (int i = 0; i < nlocal; i++) {
+    if ( (mask[i] & movebit) && (mask[i] & groupbit) ) {
+      dtfm = dtf / mass[type[i]];
+      v[i][0] += dtfm * f[i][0];
+      v[i][1] += dtfm * f[i][1];
+      v[i][2] += dtfm * f[i][2];
+    }
+  }
+
+  // revtest per-step switching-trajectory log with scheduled PE and on-demand collective KE
+  if (revtest && trial != 0) {
+    recompute_peatom(VIRIAL_ATOM);   // fresh per-atom PE this step; Verlet's eflag isn't set here
+    c_keatom->compute_peratom();
+    double lambda  = input->variable->compute_equal(lambda_var);
+    double pereal  = c_pereal->compute_scalar();
+    double kereal  = c_kereal->compute_scalar();
+    // Omega is the acceptance-exponent quantity
+    // g is reactant-to-product progress rather than raw lambda because deletion ramps downward
+    double mu_old  = (oldtype <= nrealtypes) ? mu[oldtype] : 0.0;
+    double mu_new  = (newtype <= nrealtypes) ? mu[newtype] : 0.0;
+    double g = (trial == -1) ? 1.0 - lambda : lambda;   // 0 at reactant, 1 at product
+
+    // same ideal-gas density factor as end_of_step
+    // keep typecount[0] volume and lambda3 cases in step with acceptance logic below
+    double volume;
+    if (cap) volume = domain->xprd * domain->yprd * (zcaphi - zcaplo);
+    else volume = domain->xprd * domain->yprd * domain->zprd;
+    double dens = 1.0;
+    if      (trial == -1) dens = (typecount[0]+1) * lambda3[oldtype] / volume;
+    else if (trial ==  1) dens = volume / lambda3[newtype] / typecount[0];
+    else if (trial ==  2) dens = lambda3[oldtype] / lambda3[newtype];
+
+    double H = pereal + kereal;
+    double Omega = H - ((1.0 - g)*mu_old + g*mu_new) - g*log(dens)/beta;
+    if (comm->me == 0) {
+      if (!revtest_fp) {
+        revtest_fp = fopen("revtest.dat","a");
+        if (!revtest_fp) error->one(FLERR,"Cannot open revtest.dat");
+        fseek(revtest_fp,0,SEEK_END);
+        if (ftell(revtest_fp) == 0)   // header only on a freshly-created/empty file
+          fmt::print(revtest_fp,"# t trial oldtype newtype lambda pereal kereal H Omega\n");
+      }
+      fmt::print(revtest_fp,"{} {} {} {} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}\n",
+                 update->ntimestep, trial, oldtype, newtype, lambda, pereal, kereal, H, Omega);
+      fflush(revtest_fp);
+    }
+  }
+}
+
+void FixUMC::print()
+{
+  if (!print_text) return;
+
+  print_count++;
+  if (print_count % print_nevery) return;
+
+  strncpy(print_copy, print_text, print_maxcopy);
+  input->substitute(print_copy, print_work, print_maxcopy, print_maxwork, 0);
+
+  if (comm->me == 0 && print_fp) {
+    fmt::print(print_fp, "{}\n", print_copy);
+    fflush(print_fp);
+  }
+}
+
+void FixUMC::restore_atom()
+{
+  int n = nlocal_stored;
+  if (n > atom->nmax) error->all(FLERR,"n>nmax restore not supported");
+
+  atom->nlocal = n;
+  atom->nghost = 0;
+  
+  if (n == 0) return;
+
+  memcpy( atom->x[0], x_stored,n*3*sizeof(double));
+  memcpy( atom->type, type_stored, n*sizeof(int));
+  memcpy( atom->mask, mask_stored, n*sizeof(int));
+  memcpy( atom->tag, tag_stored, n*sizeof(tagint));
+  memcpy( atom->image, image_stored, n*sizeof(imageint));
+  
+  atom->avec->force_clear(0,sizeof(double)*nlocal_stored);
+}
+
+// after initiate_gcmc so transforming particle in igroup
+void FixUMC::initiate_velocities()
+{
+  double sigma;
+
+  double **v = atom->v;
+  double *mass = atom->mass;
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  // revtest reverse leg flips forward velocities without resampling so velocity-Verlet retraces
+  if (revtest && reverse) {
+    if (comm->me == 0) utils::logmesg(lmp,"reversing velocities for revtest\n");
+    for (int i = 0; i < nlocal; i++)
+      for (int x = 0; x < 3; x++) v[i][x] *= -1.;
+    return;
+  }
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & movebit) {
+      // sample each move-group atom at its own type mass to match initial_integrate
+      sigma = sqrt( beta_md * mass[type[i]] * force->mvv2e);
+      v[i][0] = random_unequal->gaussian() / sigma;
+      v[i][1] = random_unequal->gaussian() / sigma;
+      v[i][2] = random_unequal->gaussian() / sigma;
+    }
+    // need to explicitly set to 0 bc cap/base can become finite after restoring
+    else {
+      v[i][0] = 0.;
+      v[i][1] = 0.;
+      v[i][2] = 0.;
+    }
+  }
+}
+
+// assumes atomic energies are up to date
+void FixUMC::store_pe() {
+  pereal_stored = c_pereal->compute_scalar();
+}
+
+void FixUMC::store_ke() {
+  c_keatom->compute_peratom();
+  kereal_stored = c_kereal->compute_scalar();
+}
+
+void FixUMC::store_atom() {
+  // add charge if qflag
+  
+  int n = atom->nlocal;
+  nlocal_stored = n;
+  if (n == 0) return;
+
+  if (n > nmax_stored ) {
+    memory->sfree(x_stored);
+    memory->sfree(type_stored);
+    memory->sfree(mask_stored);
+    memory->sfree(tag_stored);
+    memory->sfree(image_stored);
+    
+    x_stored = (double *) memory->smalloc(n*3*sizeof(double),"umc:x_stored");
+    type_stored = (int *) memory->smalloc(n*sizeof(int),"umc:type_stored");
+    mask_stored = (int *) memory->smalloc(n*sizeof(int),"umc:mask_stored");
+    tag_stored = (tagint *) memory->smalloc(n*sizeof(tagint),"umc:tag_stored");
+    image_stored = (imageint *) memory->smalloc(n*sizeof(imageint),"umc:image_stored");
+    
+    nmax_stored = n;
+  }
+
+  memcpy( x_stored, atom->x[0], 3*n*sizeof(double));
+  memcpy( type_stored, atom->type, n*sizeof(int));
+  memcpy( mask_stored, atom->mask, n*sizeof(int));
+  memcpy( tag_stored, atom->tag, n*sizeof(tagint));
+  memcpy( image_stored, atom->image, n*sizeof(imageint));
+}
+
+void FixUMC::trial_xycap()
+{
+  nxycap_trials++;
+  if (comm->me == 0) utils::logmesg(lmp,"starting xycap MC\n");
+
+  double xshift = random_equal->gaussian() * xycapmax;
+  double yshift = random_equal->gaussian() * xycapmax;
+
+  // shift upper cap rigidly in x/y with sign selecting proposal or rejection undo
+  auto shift = [&](double sign) {
+    for (int i=0; i<atom->nlocal; i++) {
+      if (atom->mask[i] & group->bitmask[icaphigroup]) {
+        atom->x[i][0] += sign * xshift;
+        atom->x[i][1] += sign * yshift;
+      }
+    }
+    reneighbor();
+    recompute_peatom(0);
+  };
+
+  shift(1.);
+
+  double pe_diff = c_pereal->compute_scalar() - pereal_stored;
+
+  double pmove = exp(-beta * pe_diff);
+
+  if (random_equal->uniform() < pmove ) { // accept
+    nxycap_accepts++;
+    if (comm->me == 0) utils::logmesg(lmp,"t = {} dx = {} dy = {} xycap accepted ({}/{})\n",update->ntimestep,xshift,yshift,nxycap_accepts,nxycap_trials);
+      
+    store_pe();
+    store_atom();
+  }
+  else { // reject
+    if (comm->me == 0) utils::logmesg(lmp,"xycap rejected ({}/{})\n",nxycap_accepts,nxycap_trials);
+
+    shift(-1.);
+
+    domain->print_box("restored recalculated ");
+   
+    double pereal_restored = c_pereal->compute_scalar();
+    if (comm->me == 0) utils::logmesg(lmp,"pereal restored = {:.3f} stored = {:.3f}\n",pereal_restored,pereal_stored);
+    
+  }
+}
+
+void FixUMC::trial_zcap()
+{
+  nzcap_trials++;
+  double volume_stored = domain->xprd * domain->yprd * (zcaphi - zcaplo);
+
+  double zshift = random_equal->gaussian() * zcapmax;
+
+  if (comm->me == 0) utils::logmesg(lmp,"group hi = {}, lo = {}, shift = {}\n",zcaphi,zcaplo,zshift);
+
+  // reject out-of-support z proposals before touching the box because gaussian tails can invert the slab
+  if (zcaphi + zshift - zcaplo <= neighbor->cutneighmax ||
+      domain->boxhi[2] + zshift - domain->boxlo[2] <= neighbor->cutneighmax) {
+    if (comm->me == 0)
+      utils::logmesg(lmp,"zcap rejected: slab would fall below the neighbor cutoff ({}/{})\n",
+                     nzcap_accepts,nzcap_trials);
+    return;
+  }
+
+  // stretch zcap slab by sign*zshift while shifting the upper cap rigidly
+  auto shift = [&](double sign) {
+    double dz = sign * zshift;
+    domain->boxhi[2] += dz;
+    domain->set_global_box();
+    domain->set_local_box();
+
+    for (int i = 0; i < atom->nlocal; i++) {
+      if (atom->mask[i] & movebit) {
+        double zfrac = (atom->x[i][2] - zcaplo) / (zcaphi - zcaplo);
+        atom->x[i][2] = zcaplo + zfrac * (zcaphi + dz - zcaplo);
+      } else if (atom->mask[i] & group->bitmask[icaphigroup]) {
+        atom->x[i][2] += dz;
+      }
+    }
+    zcaphi += dz;
+
+    // box bounds and scaled atoms changed so owners and neighbor bins are stale
+    // also picks up reset_box comm setup and setup_bins via box_change
+    reneighbor();
+    recompute_peatom(0);
+  };
+
+  domain->print_box("initial ");
+  shift(1.);
+  domain->print_box("recalculated ");
+
+  double pe_diff = c_pereal->compute_scalar() - pereal_stored;
+
+  // scaled real atoms only since fict atoms are uniform-normalized and cap atoms are shifted rigidly
+  bigint nreal = 0;
+  for (int itype = 1; itype <= nrealtypes; itype++) nreal += typecount[itype];
+  double volume = domain->xprd * domain->yprd * (zcaphi - zcaplo);
+  double volume_ratio = pow( (volume / volume_stored), nreal);
+  double volume_diff = volume - volume_stored;
+  if (comm->me == 0) utils::logmesg(lmp,"zshift = {}, V0 = {}, V' = {}, N = {}, volume_ratio = {}\n",zshift,volume_stored,volume,nreal,volume_ratio);
+
+  double pmove = volume_ratio * exp( -beta * (pe_diff + press * volume_diff / force->nktv2p) );
+
+  if (random_equal->uniform() < pmove ) { // accept
+    nzcap_accepts++;
+    input->variable->internal_set(i_MC_V,volume);
+    if (comm->me == 0) utils::logmesg(lmp,"zcap accepted ({}/{})\n",nzcap_accepts,nzcap_trials);
+
+    store_pe();
+    store_atom();
+  }
+  else { // reject: undo the shift
+    if (comm->me == 0) utils::logmesg(lmp,"zcap rejected ({}/{})\n",nzcap_accepts,nzcap_trials);
+
+    shift(-1.);
+
+    domain->print_box("restored recalculated ");
+  }
+}
+
+
+// isotropic (axis = -1) or single-axis (axis = 0,1,2) box-length trial move
+void FixUMC::trial_box(int axis)
+{
+  const int iso = (axis < 0);
+  const char *name = iso ? "iso" : "aniso";
+  int &ntrials  = iso ? niso_trials  : naniso_trials;
+  int &naccepts = iso ? niso_accepts : naniso_accepts;
+  ntrials++;
+
+  double volume_stored = domain->xprd * domain->yprd * domain->zprd;
+
+  if (comm->me == 0) utils::logmesg(lmp,"{} box MC: axis = {}, storing volume = {}, pereal = {}\n",name,axis,volume_stored,pereal_stored);
+
+  // proposal: iso = uniform strain on all lengths, aniso = uniform length change
+  double delta = (random_equal->uniform() - 0.5) * 2 * (iso ? isomax : anisomax);
+  double dl[3] = {0., 0., 0.};
+  if (iso) {
+    double l0 = (domain->xprd + domain->yprd + domain->zprd) / 3;
+    dl[0] = delta * domain->xprd / l0;
+    dl[1] = delta * domain->yprd / l0;
+    dl[2] = delta * domain->zprd / l0;
+  }
+  else dl[axis] = delta;
+
+  // reject unsupported boxes before mutating state because they cannot be binned or minimum-imaged safely
+  for (int d = 0; d < 3; d++) {
+    if (domain->boxhi[d] + dl[d] - domain->boxlo[d] <= neighbor->cutneighmax) {
+      if (comm->me == 0)
+        utils::logmesg(lmp,"{} box trial rejected: edge {} would fall below the neighbor cutoff ({}/{})\n",
+                       name,d,naccepts,ntrials);
+      return;
+    }
+  }
+
+  // shift boxhi by sign*dl and remap move-group atoms via old fractional coordinates
+  auto resize = [&](double sign) {
+    double boxlo[3], h_inv[6];
+    for (int d = 0; d < 3; d++) boxlo[d] = domain->boxlo[d];
+    for (int i = 0; i < 6; i++) h_inv[i] = domain->h_inv[i];
+
+    for (int d = 0; d < 3; d++) domain->boxhi[d] += sign * dl[d];
+    domain->set_global_box();
+    domain->set_local_box();
+
+    double **x = atom->x;
+    for (int i = 0; i < atom->nlocal; i++) {
+      if (atom->mask[i] & movebit) {
+        domain->x2lamda(x[i],x[i],boxlo,h_inv);
+        domain->lamda2x(x[i],x[i]);
+      }
+    }
+  };
+
+  domain->print_box("initial ");
+  resize(1.);
+  reneighbor();
+  recompute_peatom(0);
+  domain->print_box("recalculated ");
+
+  double pe_diff = c_pereal->compute_scalar() - pereal_stored;
+
+  if (comm->me == 0) utils::logmesg(lmp,"pe_diff = {:.3f}\n",pe_diff);
+
+  // scaled real atoms only since fict atoms are uniform-normalized and cap atoms are shifted rigidly
+  bigint nreal = 0;
+  for (int itype = 1; itype <= nrealtypes; itype++) nreal += typecount[itype];
+  double volume = domain->xprd * domain->yprd * domain->zprd;
+  double volume_ratio = pow( (volume / volume_stored), nreal);
+  double volume_diff = volume - volume_stored;
+  if (comm->me == 0) utils::logmesg(lmp,"delta = {}, V0 = {}, V' = {}, N = {}, volume_ratio = {}\n",delta,volume_stored,volume,nreal,volume_ratio);
+
+  // iso Hastings factor from uniform strain proposal density asymmetry
+  // additive aniso proposal is symmetric
+  double hastings = iso ? pow(volume / volume_stored, 2./3.) : 1.;
+
+  double pmove = hastings * volume_ratio
+    * exp( -beta * (pe_diff + press * volume_diff / force->nktv2p) );
+
+  if (random_equal->uniform() < pmove ) { // accept
+    naccepts++;
+    input->variable->internal_set(i_MC_V,volume);
+    if (comm->me == 0) utils::logmesg(lmp,"{} box trial accepted ({}/{})\n",name,naccepts,ntrials);
+
+    store_pe();
+    store_atom();
+  }
+  else { // reject: undo the resize
+    if (comm->me == 0) utils::logmesg(lmp,"{} box trial rejected ({}/{})\n",name,naccepts,ntrials);
+
+    resize(-1.);
+    reneighbor();
+    recompute_peatom(0);
+
+    double pereal_restored = c_pereal->compute_scalar();
+    if (comm->me == 0) utils::logmesg(lmp,"pereal restored = {:.3f} stored = {:.3f}\n",pereal_restored,pereal_stored);
+  }
+}
+
+void FixUMC::trial_sgcmc()
+{
+  nsgc_trials++;
+
+  // pick species
+  bigint nswappable = 0;
+  for (int i = 0; i < nswaptypes; i++) nswappable += typecount[swaptypes[i]];
+  if (nswappable == 0) error->all(FLERR, "Fix UMC SGC move requires a real swappable atom");
+  int noldtype = 0;
+  while (noldtype == 0) {
+    oldtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+    noldtype = typecount[oldtype];
+  }
+  
+  newtype = oldtype;
+  while (newtype == oldtype) {
+    newtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+  }
+  
+  if (comm->me == 0) utils::logmesg(lmp,"SGCMC, oldtype = {} ({}), newtype = {} ({})\n",oldtype,typecount[oldtype],newtype,typecount[newtype]);
+
+  // pick swap atom from the energy-biased distribution then change idswap to proposed type
+  bias_forward();
+
+  comm->forward_comm(this);
+
+  recompute_peatom(0);
+  
+  bias_reverse();
+
+  double pe_diff = c_pereal->compute_scalar() - pereal_stored;
+  
+  double e_diff = pe_diff + mu[oldtype] - mu[newtype];
+
+  double trial_ratio = trial_reverse / trial_forward;
+  double density_ratio = lambda3[oldtype] / lambda3[newtype]; // (1/Lambda) / (1/Lambda)
+
+  // species-pick asymmetry from non-empty redraw is 1 unless this swap empties or repopulates a species
+  int npresent = 0;
+  for (int i = 0; i < nswaptypes; i++)
+    if (typecount[swaptypes[i]] > 0) npresent++;
+  double species_ratio = (double) npresent /
+    (npresent - (typecount[oldtype] == 1 ? 1 : 0) + (typecount[newtype] == 0 ? 1 : 0));
+  
+  if (comm->me == 0) utils::logmesg(lmp,"pereal_diff = {:.3f}, mu_diff = {:.3f}, trial_ratio = {:.3f}, density_ratio = {:.3f}\n",pe_diff,mu[oldtype]-mu[newtype],trial_ratio,density_ratio);
+  
+  double pmove = density_ratio * species_ratio * trial_ratio * exp( -beta * e_diff);
+
+  // accept
+  if (random_equal->uniform() < pmove ) {
+    nsgc_accepts++; 
+    if (comm->me == 0) utils::logmesg(lmp,"e_diff = {:.3f}, SGCMC accepted ({}/{})\n",e_diff,nsgc_accepts,nsgc_trials);
+    
+    typecount[oldtype]--;
+    typecount[newtype]++;
+    
+    store_pe();
+  }
+  //reject 
+  else {
+    if (comm->me == 0) utils::logmesg(lmp,"e_diff = {:.3f}, SGCMC rejected ({}/{})\n",e_diff,nsgc_accepts,nsgc_trials);
+    //for (int i=0; i<(atom->nlocal+atom->nghost); i++) {
+    for (int i=0; i<atom->nlocal; i++) {
+      if (atom->tag[i] == idswap)  {
+        atom->type[i] = oldtype;
+      }
+    }
+    comm->forward_comm(this);
+    recompute_peatom(0);
+    double pereal_restored = c_pereal->compute_scalar();
+    if (comm->me == 0) utils::logmesg(lmp,"pereal restored = {:.3f} stored = {:.3f}\n",pereal_restored,pereal_stored);
+  }
+}
+
+void FixUMC::initiate_deletion()
+{
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  if (revtest && reverse) {
+    // reverse of a forward insertion: delete the SAME atom (idswap), no re-biasing
+    int rtmp = oldtype; oldtype = newtype; newtype = rtmp;  // oldtype=real, newtype=fict
+    if (comm->me == 0) utils::logmesg(lmp,"reverse deletion, idswap = {}, oldtype = {}, newtype = {}\n",idswap,oldtype,newtype);
+    for (int i = 0; i < nlocal; i++)
+      if (atom->tag[i] == idswap) type[i] = newtype;  // real -> fict type, stays in real group
+    ndeletion_trials++;
+    set_hybrid_lambda(1.0);   // start fully interacting (lambda=1), then fade out
+    reneighbor();
+    recompute_peatom(0);
+    return;
+  }
+
+  bigint nswappable = 0;
+  for (int i = 0; i < nswaptypes; i++) nswappable += typecount[swaptypes[i]];
+  if (nswappable == 0) error->all(FLERR, "Fix UMC deletion requires a real swappable atom");
+  int noldtype = 0;
+  while (noldtype == 0) {
+    oldtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+    noldtype = typecount[oldtype];
+  }
+  newtype = typegrid[0][oldtype];   // real oldtype -> its (0->oldtype) fict type
+
+  if (comm->me == 0) utils::logmesg(lmp,"trial = {}, oldtype = {}, newtype = {}\n",trial,oldtype,newtype);
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & fictbit)
+      type[i] = newtype;
+  }
+
+  ndeletion_trials++;
+
+  // bias with default H(x^N)
+  bias_forward();
+
+  // start from H(x^N+1)
+  set_hybrid_lambda(1.0);
+
+  // need to comm mask/type but new energy might not be necessary
+  reneighbor();
+  recompute_peatom(0);
+}
+
+void FixUMC::initiate_insertion()
+{
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  if (revtest && reverse) {
+    // reverse of a forward deletion: re-insert the SAME atom (idswap), no re-biasing
+    int rtmp = oldtype; oldtype = newtype; newtype = rtmp;  // oldtype=fict, newtype=real
+    if (comm->me == 0) utils::logmesg(lmp,"reverse insertion, idswap = {}, oldtype = {}, newtype = {}\n",idswap,oldtype,newtype);
+    for (int i = 0; i < nlocal; i++)
+      if (atom->tag[i] == idswap) { mask[i] |= groupbit; mask[i] &= ~fictbit; }  // back into real group, keeps fict type
+    ninsertion_trials++;
+    // lambda is already 0 (atom absent); grow it in as lambda 0->1
+    reneighbor();
+    recompute_peatom(0);
+    return;
+  }
+
+  if (typecount[0] == 0) error->all(FLERR, "Fix UMC insertion requires a fictitious particle");
+  newtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+  oldtype = typegrid[0][newtype];   // real newtype -> its (0->newtype) fict type
+
+  if (comm->me == 0) utils::logmesg(lmp,"trial = {}, oldtype = {}, newtype = {}\n",trial,oldtype,newtype);
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & fictbit)
+      type[i] = oldtype;
+  }
+
+  ninsertion_trials++;
+
+  // bias with H(x^N+1), fictitious particles on
+  set_hybrid_lambda(1.0);
+  // turn on fictitious particles
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & fictbit) mask[i] |= groupbit;
+  }
+
+  reneighbor();
+  recompute_peatom(0);
+  bias_forward();
+
+  // reneighbor() may reorder and reallocate the per-atom arrays
+  mask = atom->mask;
+  type = atom->type;
+  nlocal = atom->nlocal;
+
+  // restore from H(x^N), turn off fictitious particles
+  set_hybrid_lambda(0.0);
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & fictbit) mask[i] &= ~groupbit;
+  }
+
+  // restores energy/forces w/o fictitious particles
+  reneighbor();
+  recompute_peatom(VIRIAL_ATOM);
+}
+
+void FixUMC::initiate_sgcmc()
+{
+  nsgc_trials++;
+
+  if (revtest && reverse) {
+    // reverse leg: reuse the previous move's idswap, swap species, no re-biasing
+    int tmp = oldtype; oldtype = newtype; newtype = tmp;
+    bridgetype = typegrid[oldtype][newtype];   // (oldtype->newtype) sgc off-diagonal type
+    if (comm->me == 0)
+      utils::logmesg(lmp,"reverse gradual SGCMC, oldtype = {}, newtype = {}, bridgetype = {}, idswap = {}\n",
+                     oldtype,newtype,bridgetype,idswap);
+    for (int i = 0; i < atom->nlocal; i++)
+      if (atom->tag[i] == idswap) atom->type[i] = bridgetype;
+    comm->forward_comm(this);
+    recompute_peatom(0);
+    return;
+  }
+
+  bigint nswappable = 0;
+  for (int i = 0; i < nswaptypes; i++) nswappable += typecount[swaptypes[i]];
+  if (nswappable == 0) error->all(FLERR, "Fix UMC SGC move requires a real swappable atom");
+  int noldtype = 0;
+  while (noldtype == 0) {
+    oldtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+    noldtype = typecount[oldtype];
+  }
+
+  newtype = oldtype;
+  while (newtype == oldtype) {
+    newtype = swaptypes[(int) (nswaptypes * random_equal->uniform())];
+  }
+
+  bridgetype = typegrid[oldtype][newtype];   // (oldtype->newtype) sgc off-diagonal type
+
+  if (comm->me == 0)
+    utils::logmesg(lmp,"gradual SGCMC, oldtype = {} ({}), newtype = {} ({}), bridgetype = {}\n",
+                   oldtype,typecount[oldtype],newtype,typecount[newtype],bridgetype);
+
+  bias_forward();
+  comm->forward_comm(this);
+  recompute_peatom(0);
+}
+
+
+void FixUMC::bias_forward() {
+  
+  // variables
+  double plocal_sum = 0;
+  double Ei, pi;
+
+  int *mask = atom->mask;
+  int *type = atom->type;
+
+  if (atom->nlocal > atom_swap_nmax) {
+    atom_swap_nmax = atom->nlocal;
+    memory->sfree(plocal);
+    plocal = (double *) memory->smalloc(atom_swap_nmax * sizeof(double),"umc:plocal");
+  }
+ 
+  for (int i = 0; i < atom->nlocal; i++) {
+    if (trial == -1 &&
+        (mask[i] & groupbit) && (mask[i] & movebit) && 
+        type[i] == oldtype) 
+    {
+      Ei = c_peatom->vector_atom[i] - mu[oldtype];
+      pi = exp(beta_delete * Ei);
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+    else if (trial == 1 &&
+           mask[i] & fictbit && 
+           type[i] == oldtype) 
+    {
+      Ei = c_peatom->vector_atom[i] - mu[newtype];
+      pi = exp(-beta_insert * Ei);
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+    else if ((trial == 0 || trial == 2) &&
+           (mask[i] & groupbit) && (mask[i] & movebit) && 
+           type[i] == oldtype) 
+    {
+      Ei = c_peatom->vector_atom[i] - mu[oldtype];
+      pi = exp(beta_sg * Ei);
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+    // non-candidate: zero weight so the selection scan below can run condition-free
+    else plocal[i] = 0.;
+  }
+
+  if (trial == 1) dump_pefict();
+  
+  double pglobal_sum, pbefore_sum;
+  MPI_Allreduce(&plocal_sum,&pglobal_sum,1,MPI_DOUBLE,MPI_SUM,world);
+  MPI_Scan(&plocal_sum,&pbefore_sum,1,MPI_DOUBLE,MPI_SUM,world);
+  
+  pbefore_sum -= plocal_sum;
+  
+  trial_forward = 0.;
+  idswap = -1;
+  zswap = 0.0;
+
+  // find particle with probability p
+  double pmove = pglobal_sum * random_equal->uniform();
+
+  // if p points to this rank scan in weight-loop order with zero weights for non-candidates
+  if ((pmove >= pbefore_sum) && (pmove < pbefore_sum + plocal_sum)) {
+    for (int i = 0; i < atom->nlocal; i++) {
+      pbefore_sum += plocal[i];
+      if (pbefore_sum > pmove) {
+        idswap = atom->tag[i];
+        trial_forward = plocal[i] / pglobal_sum;
+        zswap = atom->x[i][2];
+
+        utils::logmesg(lmp,"selected Ei = {:.3f} xi = {:.1f},{:.1f},{:.1f}\n",
+                       c_peatom->vector_atom[i],atom->x[i][0],atom->x[i][1],atom->x[i][2]);
+
+        // transform the selected atom
+        if (trial == -1) type[i] = newtype;        // fict type, stays in real group
+        else if (trial == 1) mask[i] &= ~fictbit;  // keeps fict type, joins real group
+        else if (trial == 2) type[i] = bridgetype;
+        else type[i] = newtype;                    // trial == 0: instant semi-grand
+        break;
+      }
+    }
+  }
+
+  double trial_forward_global;
+  tagint idswap_global;
+  MPI_Allreduce(&trial_forward,&trial_forward_global,1,MPI_DOUBLE,MPI_SUM,world);
+  MPI_Allreduce(&idswap,&idswap_global,1,MPI_LMP_TAGINT,MPI_MAX,world);
+  trial_forward = trial_forward_global;
+  idswap = idswap_global;
+
+  // no atom selected means weights underflowed or overflowed and the scan never fired
+  // otherwise callers would transform nothing and accept/reject a silent no-op
+  if (idswap < 0)
+    error->all(FLERR, "fix UMC selection bias picked no atom (trial {}, oldtype {})", trial, oldtype);
+  double zlocal = 0.0;
+  for (int i = 0; i < atom->nlocal; i++) {
+    if (atom->tag[i] == idswap) {
+      zlocal = atom->x[i][2];
+      break;
+    }
+  }
+  MPI_Allreduce(&zlocal,&zswap,1,MPI_DOUBLE,MPI_SUM,world);
+  
+  if (comm->me == 0) utils::logmesg(lmp,"trial_forward = {:.8f}/{:.8f} = {:.8f}, idswap = {}, zswap = {:.6f}\n",trial_forward*pglobal_sum,pglobal_sum,trial_forward,idswap,zswap);
+}
+
+// debug dump for fictitious-particle PE after bias_forward/reverse computes the corresponding per-atom energies
+void FixUMC::dump_pefict()
+{
+  int naccepts = ninsertion_accepts + ndeletion_accepts + nmd_accepts + nsgc_accepts +
+    niso_accepts + naniso_accepts + nxycap_accepts + nzcap_accepts;
+  if (imcdump < 0 || naccepts <= npefict_dumps) return;
+  // guard modulus because variable-driven dump frequency sets every_dump to 0
+  int every = output->every_dump[imcdump];
+  if (every <= 0 || naccepts % every || output->dump[imcdump]->igroup != 0) return;
+
+  // Direct write while bias_forward/reverse still holds the fictitious-particle energies.
+  modify->clearstep_compute();
+  output->dump[imcdump]->write();
+  npefict_dumps = naccepts;
+}
+
+    
+// hybrid->scaleval = [0,1] with transforming particle in real group and fictitious or bridge type
+void FixUMC::bias_reverse() {
+  
+  // reallocate list of swaptypes atoms if needed
+  if (atom->nlocal > atom_swap_nmax) {
+    atom_swap_nmax = atom->nlocal;
+    memory->sfree(plocal);
+    plocal = (double *) memory->smalloc(atom_swap_nmax * sizeof(double),"umc:plocal");
+  }
+  
+  double plocal_sum = 0, plocal_reverse = 0;
+  double Ei, pi;
+
+  int *mask = atom->mask;
+  int *type = atom->type;
+ 
+  // include transforming particle: real group, fict type
+  for (int i = 0; i < atom->nlocal; i++) {
+    // insertion reverses as deletion with transforming particle still at fict type
+    if (trial == 1 && 
+        (mask[i] & groupbit) && 
+        (mask[i] & movebit) &&
+        (type[i] == oldtype || type[i] == newtype) ) 
+    {
+      Ei = c_peatom->vector_atom[i] - mu[newtype];
+      pi = exp(beta_delete * Ei );
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+    else if (trial == -1 &&
+            mask[i] & groupbit &&
+            type[i] == newtype) 
+    {
+      Ei = c_peatom->vector_atom[i] - mu[oldtype];
+      pi = exp(-beta_insert*Ei );
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+    else if ((trial == 0 || trial == 2) && 
+             mask[i] & groupbit && 
+             mask[i] & movebit && 
+             (type[i] == newtype || type[i] == bridgetype))
+    {
+      Ei = c_peatom->vector_atom[i] - mu[newtype];
+      pi = exp( beta_sg * Ei );
+      plocal_sum += pi;
+      plocal[i] = pi;
+    }
+
+    // non-candidate: keep plocal defined so the idswap read below is safe
+    else plocal[i] = 0.;
+
+    // find p_i
+    if (atom->tag[i] == idswap) {
+      plocal_reverse = plocal[i];
+    }
+  }
+
+  if (trial == -1) dump_pefict();
+  
+  double pglobal_reverse, pglobal_sum;
+  MPI_Allreduce(&plocal_reverse,&pglobal_reverse,1,MPI_DOUBLE,MPI_MAX,world); // should change to one-to-all
+  MPI_Allreduce(&plocal_sum,&pglobal_sum,1,MPI_DOUBLE,MPI_SUM,world);
+
+  trial_reverse = pglobal_reverse/pglobal_sum;
+  
+  if (comm->me == 0) utils::logmesg(lmp,"trial_reverse = {:.8f}/{:.8f} = {:.8f}\n",pglobal_reverse,pglobal_sum,trial_reverse);
+
+}
+
+void FixUMC::end_of_step()
+{
+  if (update->ntimestep != laststep) return;
+  
+  if (comm->me == 0) utils::logmesg(lmp,"t = {}, evaluating trial = {}\n",update->ntimestep,trial);
+
+  // energy should be up to date
+
+  if (update->eflag_atom != update->ntimestep) {
+    error->warning(FLERR,"Atomic energies not computed. Overwritten by external output (step {})? Recomputing.",update->eflag_atom);
+    recompute_peatom(VIRIAL_ATOM);
+  }
+
+  double pereal_after = c_pereal->compute_scalar();
+  double pereal_diff = pereal_after - pereal_stored;
+  double e_diff = pereal_diff;
+  
+  c_keatom->compute_peratom();
+  double kereal_after = c_kereal->compute_scalar();
+  double kereal_diff = kereal_after - kereal_stored;
+
+  double density_ratio = 1.;
+  double trial_ratio = 1.;
+  double species_ratio = 1.; // species-pick proposal ratio (1 unless a swap species is empty)
+
+  if (trial != 0) {
+    
+    double volume;
+    if (cap) volume = domain->xprd * domain->yprd * (zcaphi - zcaplo);
+    else volume = domain->xprd * domain->yprd * domain->zprd;
+
+    // deletion/sgc redraw until non-empty while insertion picks over all swap types
+    // empty species affect acceptance on either side
+    int npresent = 0;
+    for (int i = 0; i < nswaptypes; i++)
+      if (typecount[swaptypes[i]] > 0) npresent++;
+   
+    // deletion reverses as insertion
+    // loop over all local atoms because fict atoms can sit beyond nfirst
+    if (trial == -1) {
+      
+      set_hybrid_lambda(1.0);
+      // deleted atom becomes fict and all fict atoms enter group for reverse insertion selection
+      for (int i = 0; i < atom->nlocal; i++) {
+        if (atom->tag[i] == idswap) atom->mask[i] |= fictbit;
+        if (atom->mask[i] & fictbit) atom->mask[i] |= groupbit;
+      }
+
+      reneighbor();
+      recompute_peatom(0);
+      bias_reverse();
+
+      e_diff += mu[oldtype];
+      species_ratio = (double) npresent / nswaptypes;
+      density_ratio = (typecount[0]+1) * lambda3[oldtype] / volume; // (M-N)+1 / V/L^3 
+    }
+    // insertion: already hybrid->scaleval = [0,1], which is correct for bias_reverse
+    else if (trial == 1) {
+      // insertion reverses as deletion with swap atom already in real group
+      bias_reverse();
+      
+      e_diff -= mu[newtype];
+      species_ratio = (double) nswaptypes / (npresent + (typecount[newtype] == 0 ? 1 : 0));
+      density_ratio = volume / lambda3[newtype] / typecount[0]; // V/L^3 / (M-N)
+    }
+    else if (trial == 2) {
+      bias_reverse();
+
+      e_diff += mu[oldtype] - mu[newtype];
+      species_ratio = (double) npresent /
+        (npresent - (typecount[oldtype] == 1 ? 1 : 0) + (typecount[newtype] == 0 ? 1 : 0));
+      density_ratio = lambda3[oldtype] / lambda3[newtype];
+    }
+
+    trial_ratio = trial_reverse / trial_forward;
+
+    if (comm->me == 0) utils::logmesg(lmp,"density_ratio = {:.3f}, trial_ratio = {:.6f}\n",density_ratio,trial_ratio);
+  }
+ 
+  if (comm->me == 0) utils::logmesg(lmp,"e_diff = {:.3f}, ke_diff = {:.3f}, total_diff = {:.3f}\n",e_diff,kereal_diff,e_diff+kereal_diff);
+  
+  double pmove = density_ratio * species_ratio * trial_ratio
+    * exp(-beta_md * kereal_diff - beta * e_diff);
+ 
+  // accept move
+  if (random_equal->uniform() < pmove || revtest) {
+    // displacement
+    if (trial == 0) {
+      nmd_accepts++;
+      if (comm->me == 0) utils::logmesg(lmp,"MD CMC accepted ({}/{})\n",nmd_accepts,nmd_trials);
+    }
+    // deletion
+    else if (trial == -1) {
+      ndeletion_accepts++;
+      if (comm->me == 0) utils::logmesg(lmp,"deletion GCMC accepted ({}/{})\n",ndeletion_accepts,ndeletion_trials);
+      typecount[0]++;
+      typecount[oldtype]--;
+
+      for (int i=0; i<atom->nlocal; i++) {
+        // add deleted particle to fict group
+        if (atom->tag[i] == idswap) {
+          atom->mask[i] |= fictbit;
+        }
+        // turn off vacancies left on by bias_reverse and remove deleted particle from real group
+        if (atom->mask[i] & fictbit) atom->mask[i] &= ~groupbit;
+      }
+      // last energies from bias_reverse with vacancies
+    }
+    // insertion
+    else if (trial == 1) {
+      ninsertion_accepts++;
+      if (comm->me == 0) utils::logmesg(lmp,"insertion GCMC accepted ({}/{})\n",ninsertion_accepts,ninsertion_trials);
+      typecount[0]--;
+      typecount[newtype]++;
+
+      // give idswap real type; groups should be correct from bias_reverse
+      for (int i=0; i<atom->nlocal; i++) {
+        if (atom->tag[i] == idswap) {
+          atom->type[i] = newtype;
+          break;
+        }
+      }
+
+      // report tracked counts directly to avoid two group->count scans per accepted insertion
+      // no longer an independent membership check
+      if (comm->me == 0)
+        utils::logmesg(lmp,"N[{}] = {}, fict = {}\n",newtype,typecount[newtype],typecount[0]);
+      // energies are current from the trajectory but accepted real type still needs reneighboring
+    }
+    else if (trial == 2) {
+      nsgc_accepts++;
+      if (comm->me == 0) utils::logmesg(lmp,"gradual SGCMC accepted ({}/{})\n",nsgc_accepts,nsgc_trials);
+      typecount[oldtype]--;
+      typecount[newtype]++;
+
+      for (int i=0; i<atom->nlocal; i++) {
+        if (atom->tag[i] == idswap) {
+          atom->type[i] = newtype;
+          break;
+        }
+      }
+    }
+    // store new states on step we calculated energy
+    if (pair_style_name && trial != 0) {
+      set_hybrid_lambda(0.0);
+    }
+    if (trial != 0) reneighbor();
+    recompute_peatom(VIRIAL_ATOM);
+    store_pe();
+    store_atom();
+
+    // Arm the MC dump for this step; Verlet calls output->write() after end_of_step.
+    int naccepts = ninsertion_accepts + ndeletion_accepts + nmd_accepts + nsgc_accepts +
+      niso_accepts + naniso_accepts + nxycap_accepts + nzcap_accepts;
+    // every_dump <= 0 for a variable-driven frequency would divide by zero
+    int every = (imcdump > -1) ? output->every_dump[imcdump] : 0;
+    if (every > 0 && naccepts % every == 0) {
+      bigint t = update->ntimestep;
+      output->next = t;
+      output->next_dump_any = t;
+      output->next_dump[imcdump] = t;
+    }
+  }
+  // reject move
+  else {
+    if (comm->me == 0) utils::logmesg(lmp,"Hamiltonian trajectory rejected\n");
+    restore_atom();
+    if (pair_style_name && trial != 0) {
+      set_hybrid_lambda(0.0);
+    }
+    // need to recompute neighbor lists entirely
+    reneighbor();
+    recompute_peatom(VIRIAL_ATOM);
+    
+    double pereal_restored = c_pereal->compute_scalar();
+    if (comm->me == 0) utils::logmesg(lmp,"pereal restored = {:.3f} stored = {:.3f}\n",pereal_restored,pereal_stored);
+  }
+
+  print();
+}
+
+void FixUMC::reneighbor() {
+  if (modify->n_pre_exchange) {
+    timer->stamp();
+    modify->pre_exchange();
+    timer->stamp(Timer::MODIFY);
+  }
+  if (domain->triclinic) domain->x2lamda(atom->nlocal);
+  domain->pbc();
+  // mirror Verlet reneighbor block for enabled box moves so bins and comm cutoffs update
+  if (domain->box_change) {
+    domain->reset_box();
+    comm->setup();
+    if (neighbor->style) neighbor->setup_bins();
+  }
+  timer->stamp();
+  comm->exchange();
+  if (atom->sortfreq == 1) atom->sort(); // only sort if would every step
+  comm->borders();
+  if (domain->triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
+  timer->stamp(Timer::COMM);
+  if (modify->n_pre_neighbor) {
+    modify->pre_neighbor();
+    timer->stamp(Timer::MODIFY);
+  }
+  neighbor->build(1);
+  timer->stamp(Timer::NEIGH);
+  if (modify->n_post_neighbor) {
+    modify->post_neighbor();
+    timer->stamp(Timer::MODIFY);
+  }
+}
+
+void FixUMC::recompute_peatom(int vflag)
+{
+  // eflag/vflag usually set based on computes in protected integrate::ev_set(timestep)
+  int eflag = ENERGY_ATOM;
+
+  // update-> flags tell compute that energies/virials will be current
+  update->eflag_atom = update->ntimestep;
+  if (vflag) update->vflag_atom = update->ntimestep;
+
+  update->integrate->force_clear();
+
+  timer->stamp();
+
+  if (modify->n_pre_force) {
+    modify->pre_force(vflag);
+    timer->stamp(Timer::MODIFY);
+  }
+  force->pair->compute(eflag,vflag);
+  timer->stamp(Timer::PAIR);
+ 
+  if (modify->n_pre_reverse) {
+    modify->pre_reverse(eflag,vflag);
+    timer->stamp(Timer::MODIFY);
+  }
+  if (force->newton) {
+    comm->reverse_comm();
+    timer->stamp(Timer::COMM);
+  }
+ 
+  if (modify->n_post_force_any) modify->post_force(vflag);
+  timer->stamp(Timer::MODIFY);
+
+  c_peatom->compute_peratom();
+
+  // capture virial only when tallied because compute stress/atom is only valid then
+  // MC_P and MC_Pz reuse it across instant-move bursts
+  if (vflag) {
+    c_preal->compute_vector();
+    virial_stored  = c_preal->vector[0] + c_preal->vector[1] + c_preal->vector[2];
+    virialz_stored = c_preal->vector[2];
+  }
+}
+
+/* ----------------------------------------------------------------------
+  return acceptance ratio
+------------------------------------------------------------------------- */
+
+double FixUMC::compute_vector(int j)
+{
+  if (j == 0) return nmd_trials;
+  if (j == 1) return nmd_accepts;
+  if (j == 2) return ndeletion_trials + ninsertion_trials;
+  if (j == 3) return ndeletion_accepts + ninsertion_accepts;
+  if (j == 4) return nsgc_trials;
+  if (j == 5) return nsgc_accepts;
+  if (j == 6) return niso_trials + naniso_trials + nxycap_trials + nzcap_trials;
+  if (j == 7) return niso_accepts + naniso_accepts + nxycap_accepts + nzcap_accepts;
+  return 0.0;
+}
+
+/* ----------------------------------------------------------------------
+  per-species state
+  row i = real species i+1 col 0 = N col 1 = mu
+  read live on every variable evaluation through MC_N<i>/MC_mu<i>
+  mu is the value latched for the current trial
+  NULL species report mu as NaN
+------------------------------------------------------------------------- */
+
+double FixUMC::compute_array(int i, int j)
+{
+  if (!typecount) return 0.0;   // the array exists from the ctor, typecount only from init()
+  if (j == 0) return (double) typecount[i+1];
+  if (j == 1) return mu[i+1];
+  if (j == 2) return pereal_stored;
+  if (j == 3) return virial_stored;   // trace, for MC_P
+  if (j == 4) return virialz_stored;  // zz, for MC_Pz
+  if (j == 5) {                       // real atoms, the ideal-gas term of MC_P/MC_Pz
+    bigint n = 0;
+    for (int itype = 1; itype <= nrealtypes; itype++) n += typecount[itype];
+    return (double) n;
+  }
+  return 0.0;
+}
+
+/* ----------------------------------------------------------------------
+   memory usage of local atom-based arrays
+------------------------------------------------------------------------- */
+
+double FixUMC::memory_usage()
+{
+  // plocal selection weights plus stored rollback configuration
+  double bytes = (double) atom_swap_nmax * sizeof(double);
+  bytes += (double) nmax_stored * (3*sizeof(double) + 2*sizeof(int) + sizeof(tagint) + sizeof(imageint));
+  return bytes;
+}
+
+// from fix atom/swap
+int FixUMC::pack_forward_comm(int n, int *list, double *buf, int /*pbc_flag*/, int * /*pbc*/)
+{
+  int i, j, m;
+
+  int *type = atom->type;
+  double *q = atom->q;
+
+  m = 0;
+
+  if (atom->q_flag) {
+    for (i = 0; i < n; i++) {
+      j = list[i];
+      buf[m++] = type[j];
+      buf[m++] = q[j];
+    }
+  } else {
+    for (i = 0; i < n; i++) {
+      j = list[i];
+      buf[m++] = type[j];
+    }
+  }
+
+  return m;
+}
+
+void FixUMC::unpack_forward_comm(int n, int first, double *buf)
+{
+  int i, m, last;
+
+  int *type = atom->type;
+  double *q = atom->q;
+
+  m = 0;
+  last = first + n;
+
+  if (atom->q_flag) {
+    for (i = first; i < last; i++) {
+      type[i] = static_cast<int>(buf[m++]);
+      q[i] = buf[m++];
+    }
+  } else {
+    for (i = first; i < last; i++) type[i] = static_cast<int>(buf[m++]);
+  }
+}
