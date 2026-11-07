@@ -1,0 +1,19 @@
+cutoff: 6.
+
+data: { filename: ../train.pkl.gz, test_filename: ../test.pkl.gz, subtract_zbl: true, save_dataset: false }
+
+potential:
+  kwargs: { max_order: 4, lmax: [4,4,4,2], n_rad_base: 16, n_rad_max: [16,16,8,4], basis_type: ClampedBeam, radial: linear_max, fs_parameters: 8 }
+
+fit:
+  loss:
+    l2_reg: 1.e-8
+    energy: { weight: 0.05, type: huber, delta: 0.01 }
+    forces: { weight: 0.95, type: huber, delta: 0.1 }
+    switch: { after_iter: 3000, energy: { weight: 0.95 }, forces: { weight: 0.05 } }
+  maxiter: 10000
+  checkpoint_freq: 100
+  optimizer: BFGS
+  batch_size: 1024
+  test_batch_size: 256
+  jit_compile: true

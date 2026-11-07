@@ -936,9 +936,9 @@ void FixUMC::final_integrate()
         if (!revtest_fp) error->one(FLERR,"Cannot open revtest.dat");
         fseek(revtest_fp,0,SEEK_END);
         if (ftell(revtest_fp) == 0)   // header only on a freshly-created/empty file
-          fmt::print(revtest_fp,"# t trial oldtype newtype lambda pereal kereal H Omega\n");
+          utils::print(revtest_fp,"# t trial oldtype newtype lambda pereal kereal H Omega\n");
       }
-      fmt::print(revtest_fp,"{} {} {} {} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}\n",
+      utils::print(revtest_fp,"{} {} {} {} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}\n",
                  update->ntimestep, trial, oldtype, newtype, lambda, pereal, kereal, H, Omega);
       fflush(revtest_fp);
     }
@@ -956,7 +956,7 @@ void FixUMC::print()
   input->substitute(print_copy, print_work, print_maxcopy, print_maxwork, 0);
 
   if (comm->me == 0 && print_fp) {
-    fmt::print(print_fp, "{}\n", print_copy);
+    utils::print(print_fp, "{}\n", print_copy);
     fflush(print_fp);
   }
 }
