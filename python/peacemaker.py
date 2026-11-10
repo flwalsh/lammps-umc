@@ -25,8 +25,6 @@ import sys
 import time
 import zlib
 from dataclasses import dataclass, field, fields
-from importlib.util import find_spec, module_from_spec, spec_from_file_location
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -36,6 +34,7 @@ import yaml
 from ase.data import atomic_numbers
 from scipy.optimize import brentq
 from scipy.optimize._linesearch import line_search_wolfe1, line_search_wolfe2
+from scipy.spatial import ConvexHull
 from torch import func
 from torch.nn import functional
 
@@ -45,44 +44,91 @@ torch._functorch.config.donated_buffer = False
 
 DTYPE = torch.float64
 
-ROOT = Path(find_spec("tensorpotential").submodule_search_locations[0])
-
-
-def call_grace_no_tf(path):
-    spec = spec_from_file_location("_grace", ROOT / path)
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-real_coupling_metainformation = call_grace_no_tf(
-    "functions/couplings.py").real_coupling_metainformation
-
-
-def parity_sign(parity):
-    return "+" if parity > 0 else "-"
-
-
-def drop_swaps(df, A, B):
-    cols = ["hist", "l", "parity", "sum_of_ls"]
-    pairings = {}
-    for h1, l1, p1, n1 in set(map(tuple, A[cols].itertuples(index=False))):
-        for h2, l2, p2, n2 in set(map(tuple, B[cols].itertuples(index=False))):
-            if l1 == l2:
-                pairings[f"({h1}{l1}{parity_sign(p1)},{h2}{l2}{parity_sign(p2)})"] = (
-                    (h1, p1, n1), (h2, p2, n2))
-
-    df = df[df["l2"] <= df["l1"]]
-    keep = []
-    for row in df.itertuples():
-        if row.l1 == row.l2:
-            (h1, p1, n1), (h2, p2, n2) = pairings[row.hist]
-            swap = f"({h2}{row.l1}{parity_sign(p2)},{h1}{row.l1}{parity_sign(p1)})"
-            if (h1, p1, n1) > (h2, p2, n2) and swap in pairings:
-                continue
-        keep.append(row.Index)
-
-    return df.loc[keep].reset_index(drop=True)
+# couplings (l1, l2, L) couple two l or two couplings to L, invariants to 0, listed by rank and largest l
+COUPLINGS = {
+    "base": {1: [0],
+             2: [(0, 0, 0),
+                 (1, 1, 0),
+                 (2, 2, 0),
+                 (3, 3, 0),
+                 (4, 4, 0),
+                 (5, 5, 0)],
+             3: [((0, 0, 0), 0, 0),
+                 ((1, 1, 0), 0, 0),
+                 ((2, 2, 0), 0, 0),
+                 ((2, 1, 1), 1, 0),
+                 ((2, 2, 2), 2, 0),
+                 ((3, 3, 0), 0, 0),
+                 ((3, 2, 1), 1, 0),
+                 ((3, 3, 2), 2, 0),
+                 ((4, 4, 0), 0, 0),
+                 ((4, 3, 1), 1, 0),
+                 ((4, 2, 2), 2, 0),
+                 ((4, 4, 2), 2, 0),
+                 ((4, 3, 3), 3, 0),
+                 ((4, 4, 4), 4, 0)],
+             4: [((0, 0, 0), (0, 0, 0), 0),
+                 ((0, 0, 0), (1, 1, 0), 0),
+                 ((1, 1, 0), (1, 1, 0), 0),
+                 ((0, 0, 0), (2, 2, 0), 0),
+                 ((1, 0, 1), (2, 1, 1), 0),
+                 ((2, 0, 2), (2, 2, 2), 0),
+                 ((1, 1, 0), (2, 2, 0), 0), ((2, 1, 1), (2, 1, 1), 0),
+                 ((2, 2, 0), (2, 2, 0), 0), ((2, 2, 2), (2, 2, 2), 0),
+                 ((0, 0, 0), (3, 3, 0), 0),
+                 ((1, 0, 1), (3, 2, 1), 0),
+                 ((2, 0, 2), (3, 3, 2), 0),
+                 ((1, 1, 2), (3, 1, 2), 0),
+                 ((1, 1, 0), (3, 3, 0), 0), ((3, 1, 2), (3, 1, 2), 0),
+                 ((2, 1, 1), (3, 2, 1), 0), ((2, 2, 2), (3, 1, 2), 0),
+                 ((3, 1, 2), (3, 3, 2), 0),
+                 ((2, 2, 0), (3, 3, 0), 0), ((3, 2, 1), (3, 2, 1), 0), ((3, 2, 3), (3, 2, 3), 0),
+                 ((3, 3, 0), (3, 3, 0), 0), ((3, 3, 2), (3, 3, 2), 0),
+                 ((0, 0, 0), (4, 4, 0), 0),
+                 ((1, 0, 1), (4, 3, 1), 0),
+                 ((2, 0, 2), (4, 2, 2), 0),
+                 ((2, 0, 2), (4, 4, 2), 0),
+                 ((3, 0, 3), (4, 3, 3), 0),
+                 ((4, 0, 4), (4, 4, 4), 0),
+                 ((1, 1, 2), (4, 2, 2), 0),
+                 ((1, 1, 0), (4, 4, 0), 0), ((4, 1, 3), (4, 1, 3), 0),
+                 ((2, 1, 1), (4, 3, 1), 0), ((3, 1, 2), (4, 2, 2), 0), ((3, 2, 3), (4, 1, 3), 0),
+                 ((3, 1, 2), (4, 4, 2), 0), ((4, 1, 3), (4, 3, 3), 0),
+                 ((2, 2, 2), (4, 2, 2), 0),
+                 ((2, 2, 0), (4, 4, 0), 0), ((4, 2, 2), (4, 2, 2), 0), ((4, 2, 4), (4, 2, 4), 0),
+                 ((3, 2, 1), (4, 3, 1), 0), ((3, 2, 3), (4, 3, 3), 0), ((3, 3, 4), (4, 2, 4), 0),
+                 ((4, 2, 2), (4, 4, 2), 0), ((4, 2, 4), (4, 4, 4), 0),
+                 ((3, 3, 0), (4, 4, 0), 0), ((3, 3, 2), (4, 4, 2), 0), ((4, 3, 1), (4, 3, 1), 0), ((4, 3, 3), (4, 3, 3), 0),
+                 ((4, 4, 0), (4, 4, 0), 0), ((4, 4, 2), (4, 4, 2), 0), ((4, 4, 4), (4, 4, 4), 0)],
+             5: [(((0, 0, 0), 0, 0), (0, 0, 0), 0),
+                 (((0, 0, 0), 0, 0), (1, 1, 0), 0),
+                 (((1, 0, 1), 1, 0), (1, 1, 0), 0),
+                 (((0, 0, 0), 0, 0), (2, 2, 0), 0),
+                 (((1, 0, 1), 0, 1), (2, 1, 1), 0),
+                 (((2, 0, 2), 0, 2), (2, 2, 2), 0),
+                 (((1, 0, 1), 1, 0), (2, 2, 0), 0), (((2, 0, 2), 1, 1), (2, 1, 1), 0),
+                 (((2, 0, 2), 2, 0), (2, 2, 0), 0), (((2, 0, 2), 2, 2), (2, 2, 2), 0),
+                 (((1, 1, 2), 2, 0), (1, 1, 0), 0),
+                 (((1, 1, 2), 2, 0), (2, 2, 0), 0), (((2, 1, 1), 1, 2), (2, 2, 2), 0),
+                 (((2, 2, 2), 2, 2), (2, 2, 2), 0)]},
+    "ln_exclude": {4: [((2, 2, 2), (2, 2, 2), 0),
+                       ((4, 2, 4), (4, 4, 4), 0),
+                       ((4, 4, 4), (4, 4, 4), 0)],
+                   5: [(((2, 0, 2), 2, 2), (2, 2, 2), 0)]},
+    "grace_exclude": {4: [((2, 2, 2), (2, 2, 2), 0),
+                          ((4, 2, 4), (4, 4, 4), 0)]},
+    "grace_include": {4: [((1, 1, 2), (2, 2, 2), 0), ((2, 1, 3), (2, 1, 3), 0),
+                          ((1, 1, 2), (3, 3, 2), 0), ((3, 1, 4), (3, 1, 4), 0),
+                          ((2, 1, 3), (3, 2, 3), 0), ((2, 2, 4), (3, 1, 4), 0),
+                          ((2, 2, 2), (3, 3, 2), 0), ((2, 2, 4), (3, 3, 4), 0),
+                          ((3, 3, 4), (3, 3, 4), 0),
+                          ((1, 1, 2), (4, 4, 2), 0),
+                          ((2, 1, 3), (4, 3, 3), 0), ((3, 1, 4), (4, 2, 4), 0),
+                          ((3, 1, 4), (4, 4, 4), 0),
+                          ((2, 2, 2), (4, 4, 2), 0), ((2, 2, 4), (4, 4, 4), 0),
+                          ((3, 3, 2), (4, 2, 2), 0),
+                          ((3, 3, 4), (4, 4, 4), 0)]},
+}
 
 
 @dataclass
@@ -93,14 +139,10 @@ class Potential:
     radial: str = "ln"
     chemistry: str = None
     n_rad_base: int | tuple = 20
-    n_rad_max: tuple = (20, 15, 10, 5)
-    lmax: tuple = (5, 5, 4, 3)
-    lmax_hist: tuple = None
-    max_sum_l: tuple = (None, None, None, None)
+    n_rad_max: tuple = (16, 16, 8, 4, 2)
+    lmax: tuple = (5, 5, 4, 3, 2)
     n_mlp_dens: int = None
     activation: str = "silu"
-    Lmax: tuple = (None, 4, 0, 0)
-    Lmin: tuple = (None, 0, 0, 0)      # 1 drops invariants that are products of lower ranks
     max_order: int = 4
     rcut: float = 6.0
     rclamp: float = 0.0
@@ -110,14 +152,19 @@ class Potential:
     avg_n_neigh: float = 1.0
     out_scale: float = 1.0
     out_shift: float = 0.0
-    parity: str = "real"
     init: str = "deterministic"
     seed: int = None
     central_rank: int = 1
     zbl: bool = False
     params: dict = field(init=False, default_factory=dict)
-    wrad: dict = field(init=False, default_factory=dict)
-    keep_parity: list = field(init=False, default=None)
+
+    def __post_init__(self):
+        if isinstance(self.n_rad_base, int):
+            self.n_rad_base = (self.n_rad_base, self.n_rad_base)
+        if self.chemistry is None:
+            self.chemistry = "Zn" if "linear" in self.radial else "Zembed"
+        if self.mlp_hidden is None and self.n_mlp_dens is not None:
+            self.mlp_hidden = (self.n_mlp_dens,)
 
 
 def learn(p, name, *shape, scale=1.0, fill=None):
@@ -136,17 +183,14 @@ def learn_diagonal(p, name, *shape, fill=0.0):
     return w
 
 
-def learn_wrad(p, name, slot, *shape):
+def learn_wrad(p, name, slot, nrows, nout, nin):
     # cyclic shifts by slot, so AA's factors do not get equal gradients forever
-    nout, nin = shape[-2], shape[-1]
     if p.init != "deterministic":
-        return learn(p, name, *shape, scale=nin ** -0.5)
-
-    w = learn(p, name, *shape, fill=0.0)
+        return learn(p, name, nrows, nout, nin, scale=nin ** -0.5)
+    w = learn(p, name, nrows, nout, nin, fill=0.0)
+    k = torch.arange(nout, device=p.device)
     with torch.no_grad():
-        for b, start in enumerate(range(0, nout, nin)):
-            k = torch.arange(start, min(start + nin, nout), device=p.device)
-            w[..., k, (k - start + slot - 1) % nin] += 0.5 ** b
+        w[:, k, (k + slot - 1) % nin] = 0.5 ** (k // nin).to(DTYPE)
     return w
 
 
@@ -302,405 +346,167 @@ def spherical_harmonics(lmax, dtype, device):
     return sph
 
 
-# --- coupling tables ---
+# --- the one-particle basis ---
 
-def collect(table, max_l, l_p=None, numbering=("parity", "l", "hist")):
-    # radial transforms number channels (l, parity, hist), densities (parity, l, hist)
-    # order kept is always (parity, l, hist) whatever numbering says
-    groups = table.groupby(["parity", "l", "hist"]).indices
-    kept = np.concatenate(
-        [v for (p, l, *_), v in groups.items()
-         if l <= max_l and (l_p is None or [l, p] in l_p)])
-
-    channels = table.iloc[kept].reset_index(drop=True)
-    numbered = channels.groupby(list(numbering)).indices
-    weight_of = np.zeros(len(channels), dtype=np.int64)
-    for i, v in enumerate(numbered.values()):
-        weight_of[v] = i
-
-    return kept, weight_of, len(numbered), channels
-
-
-# --- the pieces the model is made of ---
-
-def build_chemistry(p, l_tile, nrad_A):
-    nelements, nl = len(p.element_map), max(p.lmax) + 1
-    fill = 1.0 if p.init == "deterministic" else None
-    if p.radial == "linear_max" and p.central_rank > 1:
-        w = central_mixture(
-            p, "z", learn(p, "z", nelements, nrad_A, fill=fill))
-        return lambda mu_i, mu_j: w()[mu_i, mu_j][:, :, None]
-    if p.chemistry == "Z":
-        w = learn(p, "z", nelements, fill=fill)
-        return lambda mu_i, mu_j: w[mu_j][:, None, None]
-    if p.chemistry == "Zn":
-        w = learn(p, "z", nelements, nrad_A, fill=fill)
-        return lambda mu_i, mu_j: w[mu_j][:, :, None]
-    if p.chemistry == "Znl":
-        w = learn(p, "z", nelements, nrad_A, nl, fill=fill)
-        return lambda mu_i, mu_j: w[mu_j][:, :, l_tile]
-    if p.chemistry == "Zinl":
-        w = learn(p, "z", nelements, nelements, nrad_A, nl, fill=fill)
-        return lambda mu_i, mu_j: w[mu_i, mu_j][:, :, l_tile]
-    if p.chemistry == "Zembed":
-        w = learn(p, "z", nelements, p.embedding_size, fill=fill)
-        proj = (learn_diagonal(p, "z_proj", p.embedding_size, nrad_A)
-                if p.init == "deterministic" else
-                learn(p, "z_proj", p.embedding_size, nrad_A))
-        return lambda mu_i, mu_j: (w @ (proj * proj.shape[0] ** -0.5))[mu_j][:, :, None]
-
-
-# --- the model ---
-
-def build_wrad(p, name, rank, slot, operand, parent=None, side=None):
-    rows, radial_index, nradials, table = operand
-    remapped = None
-    if parent is not None:
-        l_of = table["l"].to_numpy()
-        first = {l: int(np.flatnonzero(l_of == l)[0]) for l in np.unique(l_of)}
-
-        l_col = f"l{side + 1}"
-        key = [l_col, "parity", "l", "hist"] + (
-            ["invariant"] if "invariant" in parent else [])
-        radial_index = parent.groupby(key).ngroup().to_numpy()
-        radial_l = np.zeros(radial_index.max() + 1, dtype=np.int64)
-        radial_l[radial_index] = parent[l_col].to_numpy()
-
-        positions, indices, block, start = [], [], [], 0
-        for group, l in enumerate(radial_l):
-            block.append(start)
-            positions.extend(range(first[l], first[l] + 2 * l + 1))
-            indices.extend([group] * (2 * l + 1))
-            start += 2 * l + 1
-
-        remapped = [np.asarray(ind) - first[radial_l[group]] + block[group]
-                    for ind, group in zip(parent[("left_inds", "right_inds")[side]],
-                                          radial_index)]
-        table = table.iloc[positions].reset_index(drop=True)
-        rows, radial_index, nradials = rows[positions], indices, len(radial_l)
-    else:
-        table = table.copy()
-
-    nout = p.n_rad_max[rank - 1]
-    radial_index = np.asarray(radial_index)
-    table["radial"] = radial_index * nout
-    rows = torch.tensor(rows, dtype=torch.int64, device=p.device)
-    key = f"wrad.{name}"
-    if p.radial == "linear":
-        radial_index = np.zeros_like(radial_index)
-        nradials = 1
-        key = f"wrad.{slot}"
-    radial_index = torch.tensor(radial_index, dtype=torch.int64, device=p.device)
-
-    if key not in p.params:
-        shape = (nradials, nout, p.n_rad_base[1])
-        learn_wrad(p, key, slot, *shape)
-    w = p.params[key]
-    if p.radial == "linear_max" and p.central_rank > 1:
-        expanded = central_mixture(p, key, w)
-        p.wrad[name] = expanded().detach()[..., :nradials, :nout, :]
-
-        def transform(A, mu_i):
-            w = expanded()[..., :nradials, :nout, :]
-            return torch.einsum("aekn,ane->ake", w[:, radial_index][mu_i],
-                                A[:, :, rows])
-
-        return transform, remapped, table
-
-    w = w[..., :nradials, :nout, :]
-    p.wrad[name] = w
-
-    if w.ndim == 4:
-        def transform(A, mu_i):
-            return torch.einsum("aekn,ane->ake", w[:, radial_index][mu_i],
-                                A[:, :, rows])
-
-        return transform, remapped, table
-
-    def transform(A, mu_i):
-        return torch.einsum("ekn,ane->ake", w[radial_index], A[:, :, rows])
-
-    return transform, remapped, table
-
-
-def coupling_table(p, left, right, L_out, rank, equal=False, canonical=False):
-    channels = real_coupling_metainformation(
-        A=left, B=right, lmax=p.lmax[rank - 1],
-        Lmax=L_out,
-        lmax_hist=(p.lmax if p.lmax_hist is None else p.lmax_hist)[rank - 1], max_sum_l=p.max_sum_l[rank - 1],
-        keep_parity=p.keep_parity, is_A_B_equal=equal, normalize=True,
-    )
-    if canonical and not equal:
-        channels = drop_swaps(channels, left, right)
-    # an l=0 node below the root is a scalar, coupling it is multiplying by it
-    below = np.array([
-        min(operand.get("lowest", operand["l"]).to_numpy()[np.asarray(inds)].min()
-            for operand, inds in ((left, li), (right, ri)))
-        for li, ri in zip(channels["left_inds"], channels["right_inds"])],
-        dtype=np.int64)
-    keep = below >= p.Lmin[rank - 1]
-    channels = channels[keep].reset_index(drop=True)
-    channels["lowest"] = np.minimum(below[keep], channels["l"].to_numpy())
-    return channels
-
-
-def crop(table, readers=(), density=True):
-    # readers are the (parent, column) pairs indexing table, renumbered to the rows kept
-    keep = set(collect(table, max_l=0, l_p=[[0, 1]])[0].tolist()) if density else set()
-    for parent, col in readers:
-        keep |= set(np.concatenate(list(parent[col])).tolist())
-    keep = np.array(sorted(keep), dtype=np.int64)
-    where = np.full(len(table), -1)
-    where[keep] = np.arange(len(keep))
-    for parent, col in readers:
-        parent[col] = [where[np.asarray(v)] for v in parent[col]]
-    return table.iloc[keep].reset_index(drop=True)
-
-
-def build_coupling(p, channels, rank, left=None, right=None):
-    cg_list = channels["cg_list"]
-    left = channels["left_inds"] if left is None else left
-    right = channels["right_inds"] if right is None else right
-    left_inds = torch.tensor(np.concatenate(list(left)), dtype=torch.int64, device=p.device)
-    right_inds = torch.tensor(np.concatenate(list(right)), dtype=torch.int64, device=p.device)
-    cg = torch.tensor(np.concatenate(cg_list), dtype=DTYPE, device=p.device).reshape(1, 1, -1)
-    scatter = torch.tensor(np.concatenate([[i] * len(c) for i, c in enumerate(cg_list)]), dtype=torch.int64, device=p.device)
-    nchannels, ncrop = len(channels), p.n_rad_max[rank - 1]
-
-    def coupling(x, y):
-        v = (x[:, :ncrop, left_inds] * y[:, :ncrop, right_inds] * cg).permute(2, 0, 1)
-        out = v.new_zeros((nchannels, *v.shape[1:]))
-        return out.index_add_(0, scatter, v).permute(1, 2, 0)
-
-    return coupling, (left_inds, right_inds, cg, scatter)
-
-
-def build_density(p, name, table, rank):
-    kept, _, nweights, _ = collect(table, max_l=0, l_p=[[0, 1]])
-    kept = torch.tensor(kept, dtype=torch.int64, device=p.device)
-    if p.n_mlp_dens is None:
-        ndens = (p.fs_parameters if isinstance(p.fs_parameters, int)
-                 else len(p.fs_parameters))
-    else:
-        ndens = p.n_mlp_dens + 1
-    c = learn(p, f"density.{name}", len(p.element_map), ndens,
-              p.n_rad_max[rank - 1], nweights,
-              fill=None if p.init == "grace" else 0.0)
-    scale = p.n_rad_max[rank - 1] ** -0.5
-
-    def density(B, mu_i):
-        return torch.einsum("aknv,anv->ak", c[mu_i], B[:, :, kept]) * scale
-
-    return density
-
-
-def build_radial(p, basis, l_tile, nrad_A):
-    n_rad_base = p.n_rad_base[0]
-    has_l = p.radial == "ln"
-    shape = (nrad_A, n_rad_base)
-    if has_l:
-        shape = (nrad_A, max(p.lmax) + 1, n_rad_base)
-    crad = (learn(p, "crad", *shape, fill=0.0) if p.init == "deterministic"
-            else learn(p, "crad", *shape,
-                       scale=np.sqrt(2 / (nrad_A + n_rad_base))))
-    crad = crad.view(nrad_A, -1, n_rad_base)
+def build_radial(p, basis, nrad_A):
+    # R[n, l](r) = sum_k crad[n, l, k] g_k(r), with a single l unless radial is ln
+    nl, nk = max(p.lmax) + 1 if p.radial == "ln" else 1, p.n_rad_base[0]
     if p.init == "deterministic":
+        crad = learn(p, "crad", nrad_A, nl, nk, fill=0.0)
+        n = torch.arange(nrad_A, device=p.device)
         with torch.no_grad():
-            for b, start in enumerate(range(0, nrad_A, n_rad_base)):
-                n = torch.arange(start, min(start + n_rad_base, nrad_A),
-                                 device=p.device)
-                crad[..., n, :, n - start] = 0.5 ** b
-    if has_l:
-        r_tile = l_tile
+            crad[n, :, n % nk] = 0.5 ** (n // nk).to(DTYPE)[:, None]
     else:
-        r_tile = torch.zeros_like(l_tile)
-
+        crad = learn(p, "crad", nrad_A, nl, nk, scale=np.sqrt(2 / (nrad_A + nk)))
     if p.radial == "linear_max" and p.central_rank > 1:
         crad = central_mixture(p, "crad", crad)
+        return lambda r, mu_i: torch.einsum("bnlk,bk->bnl", crad()[mu_i], basis(r))
+    return lambda r, mu_i: torch.einsum("nlk,bk->bnl", crad, basis(r))
 
-        def radial(r, mu_i):
-            return torch.einsum("bnlk,bk->bnl", crad()[mu_i],
-                                basis(r))[:, :, r_tile]
 
-        return radial
-
-    def radial(r, mu_i):
-        return torch.einsum("nlk,bk->bnl", crad, basis(r))[:, :, r_tile]
-
-    return radial
+def build_chemistry(p, nrad_A):
+    # Z[mu_i, mu_j, n, l], with size-1 axes for what the chemistry does not depend on
+    ne, nl = len(p.element_map), max(p.lmax) + 1
+    fill = 1.0 if p.init == "deterministic" else None
+    if p.chemistry == "Zembed":
+        w = learn(p, "z", ne, p.embedding_size, fill=fill)
+        proj = (learn_diagonal(p, "z_proj", p.embedding_size, nrad_A) if p.init == "deterministic"
+                else learn(p, "z_proj", p.embedding_size, nrad_A))
+        return lambda: (w @ (proj * p.embedding_size ** -0.5))[None, :, :, None]
+    if p.radial == "linear_max" and p.central_rank > 1:
+        w = central_mixture(p, "z", learn(p, "z", ne, nrad_A, fill=fill))
+        return lambda: w()[:, :, :, None]
+    stored, full = {"Z": ((ne,), (1, ne, 1, 1)),
+                    "Zn": ((ne, nrad_A), (1, ne, nrad_A, 1)),
+                    "Znl": ((ne, nrad_A, nl), (1, ne, nrad_A, nl)),
+                    "Zinl": ((ne, ne, nrad_A, nl), (ne, ne, nrad_A, nl))}[p.chemistry]
+    w = learn(p, "z", *stored, fill=fill)
+    return lambda: w.view(full)
 
 
 def build_A(p, basis):
-    L = max(p.lmax)
-    table = pd.DataFrame(
-        [[l, m, "", 1 if l % 2 == 0 else -1, l]
-         for l in range(L + 1) for m in range(-l, l + 1)],
-        columns=["l", "m", "hist", "parity", "sum_of_ls"])
-    sph = spherical_harmonics(L, DTYPE, p.device)
-    l_tile = torch.tensor(table["l"].to_numpy(), dtype=torch.int64, device=p.device)
-    inv_navg = 1.0 / p.avg_n_neigh
+    # A[i, n, lm] = sum_j R[n, l](r_ij) Y[lm](rhat_ij) Z[mu_i, mu_j, n, l] / n_avg
+    lmax = max(p.lmax)
+    l_of = torch.tensor([l for l in range(lmax + 1) for _ in range(2 * l + 1)], device=p.device)
     nrad_A = p.n_rad_base[1] if "linear" in p.radial else p.n_rad_max[0]
-    radial = build_radial(p, basis, l_tile, nrad_A)
-    chem = build_chemistry(p, l_tile, nrad_A)
+    Y = spherical_harmonics(lmax, DTYPE, p.device)
+    R = build_radial(p, basis, nrad_A)
+    Z = build_chemistry(p, nrad_A)
+
+    def per_lm(x):
+        return x[:, :, l_of] if x.shape[2] > 1 else x
 
     def A(batch):
-        bv = batch["bond_vector"]
+        bv, mu, i, j = batch["bond_vector"], batch["atomic_mu_i"], batch["ind_i"], batch["ind_j"]
         r = torch.sqrt((bv * bv).sum(1, keepdim=True))
-        mu = batch["atomic_mu_i"]
-        mu_i, mu_j = mu[batch["ind_i"]], mu[batch["ind_j"]]
-        R = radial(r, mu_i)
-        Y = sph(bv / r)
-        out = R.new_zeros((mu.shape[0], *R.shape[1:]))
-        return out.index_add_(0, batch["ind_i"],
-                              R * Y[:, None, :] * chem(mu_i, mu_j)) * inv_navg
+        z = Z()
+        z = z[mu[i] if z.shape[0] > 1 else 0, mu[j]]
+        terms = per_lm(R(r, mu[i])) * Y(bv / r)[:, None, :] * per_lm(z)
+        return terms.new_zeros((mu.shape[0], *terms.shape[1:])).index_add_(0, i, terms) * (1.0 / p.avg_n_neigh)
 
-    return A, table
+    return A
 
 
-def build_B_basis(p, A, A_table):
-    AA = AAA = AAAA = None
-    AA_node = AAA_node = AAAA_node = None
+# --- the many-body basis ---
 
-    if p.max_order > 1:
-        AA = coupling_table(p, A_table, A_table, p.Lmax[1], 2, equal=True)
-    if p.max_order > 2:
-        AAA = coupling_table(p, AA, A_table, p.Lmax[2], 3)
-    if p.max_order > 3:
-        AAAA = coupling_table(p, AA, AA, p.Lmax[3], 4, equal=True)
+def build_B(p, A):
+    # B[rank][c] = sum over terms of cg a_1[l1 m1] ... a_k[lk mk], as LAMMPS evaluates it, a_f being A after factor f's radial mixing
+    lmax = max(l for l, _, _ in COUPLINGS["base"][2])
 
-    readers = []
-    if p.max_order > 3:
-        AAAA = crop(AAAA)
-        readers += [(AAAA, "left_inds"), (AAAA, "right_inds")]
-    if p.max_order > 2:
-        AAA = crop(AAA)
-        readers += [(AAA, "left_inds")]
-    if p.max_order > 1:
-        AA = crop(AA, readers)
+    # a grid on the sphere exact for products of three harmonics up to lmax
+    cos_theta, w_theta = np.polynomial.legendre.leggauss(3 * lmax // 2 + 1)
+    phi = np.linspace(0, 2 * np.pi, 3 * lmax + 1, endpoint=False)
+    ct, ph = np.meshgrid(cos_theta, phi, indexing="ij")
+    st = np.sqrt(1 - ct * ct)
+    rhat = np.stack([st * np.cos(ph), st * np.sin(ph), ct], -1).reshape(-1, 3)
+    weight = np.repeat(w_theta / 2 / len(phi), len(phi))
+    y = spherical_harmonics(lmax, DTYPE, "cpu")(torch.tensor(rhat)).numpy()
 
-    A_node = ("A", A_table)
-    if p.max_order > 1:
-        aa, indices = build_coupling(p, AA, 2)
-        AA_node = ("AA", AA, indices, A_node, A_node)
-    if p.max_order > 2:
-        aaa, indices = build_coupling(p, AAA, 3)
-        AAA_node = ("AAA", AAA, indices, AA_node, A_node)
-    if p.max_order > 3:
-        aaaa, indices = build_coupling(p, AAAA, 4)
-        AAAA_node = ("AAAA", AAAA, indices, AA_node, AA_node)
+    # nice way to get CG
+    def gaunt(l1, l2, L):
+        # g[M, m1, m2] = <y_LM y_l1m1 y_l2m2> / sum_m1m2 <y_L0 y_l1m1 y_l2m2>^2, <...> the average over the sphere
+        # <y_LM y_l1m1 y_l2m2> = sqrt(4 pi) (-1)^(M+m1+m2) real_gaunt(L, l1, l2, M, m1, m2) in sympy.physics.wigner
+        g = np.einsum("p,pM,pi,pj->Mij", weight, y[:, L * L:(L + 1) ** 2], y[:, l1 * l1:(l1 + 1) ** 2], y[:, l2 * l2:(l2 + 1) ** 2])
+        return g / (g[0] ** 2).sum()
 
-    def B(batch):
-        A_nlm = A(batch)
-        polys = [A_nlm[:, :p.n_rad_max[0]]]
-        if p.max_order > 1:
-            AA = aa(A_nlm, A_nlm)
-            polys.append(AA)
-        if p.max_order > 2:
-            polys.append(aaa(AA, A_nlm))
-        if p.max_order > 3:
-            polys.append(aaaa(AA, AA))
-        return polys
+    def coupling_tensor(coupling):
+        # C[M, m1, ..., mk] coupling k harmonics to L, g contracted pair by pair
+        if isinstance(coupling, int):
+            return np.eye(2 * coupling + 1)
+        left, right, L = coupling_tensor(coupling[0]), coupling_tensor(coupling[1]), coupling[2]
+        g = gaunt(len(left) // 2, len(right) // 2, L)
+        return np.tensordot(np.tensordot(g, left, (1, 0)), right, (1, 0))
 
-    return B, [A_node, AA_node, AAA_node, AAAA_node][:p.max_order]
+    ranks, layouts = [], []
+    for rank in range(1, p.max_order + 1):
+        # the listed couplings
+        excluded = COUPLINGS["ln_exclude"].get(rank, []) if p.radial == "ln" else []
+        listed = [coupling_tensor(c)[0] for c in COUPLINGS["base"][rank]]
+        listed_lmax = max(max(C.shape) for C in listed) // 2
+        if rank > 1 and p.lmax[rank - 1] > listed_lmax:
+            raise SystemExit(f"rank {rank} couplings are listed up to lmax {listed_lmax}")
+        tensors = []
+        for c, C in zip(COUPLINGS["base"][rank], listed):
+            if max(C.shape) // 2 <= p.lmax[rank - 1] and c not in excluded:
+                tensors.append(C)
 
+        # their terms, {((l1, m1), ..., (lk, mk)): cg} for each invariant
+        terms = []
+        for C in tensors:
+            ls = [n // 2 for n in C.shape]
+            terms.append({tuple((l, int(m) - l) for l, m in zip(ls, ms)): float(C[tuple(ms)])
+                          for ms in np.argwhere(np.abs(C) > 1e-12)})
+        invariant, lms, cg = zip(*[(c, lms, g) for c, t in enumerate(terms) for lms, g in t.items()])
 
-def build_wrad_B_basis(p, A, A_table):
-    by_channel = p.radial == "linear_max"
-    transforms = {}
-    AA = AAA = AAAA = None
-    AA_node = AAA_node = AAAA_node = None
-    operands = {rank: collect(A_table, max_l=p.lmax[rank - 1],
-                              numbering=("l", "parity", "hist"))
-                for rank in range(2, p.max_order + 1)}
-
-    def factors(rank, parent, *slots):
-        rows, leaves = [], []
-        for side, factor in enumerate(slots):
-            if factor is None:
-                rows.append(None)
-                leaves.append(None)
-                continue
-            name, slot = factor
-            transforms[name], inds, table = build_wrad(
-                p, name, rank, slot, operands[rank],
-                parent if by_channel else None, side)
-            rows.append(inds)
-            leaves.append((name, table))
-        return rows, leaves
-
-    if p.max_order > 1:
-        A2 = operands[2][3]
-        AA = coupling_table(p, A2, A2, 0, 2, canonical=True)
-    if p.max_order > 2:
-        A3 = operands[3][3]
-        AA3 = coupling_table(p, A3, A3, p.lmax[2], 3, canonical=True)
-        AAA = coupling_table(p, AA3, A3, 0, 3, canonical=True)
-    if p.max_order > 3:
-        A4 = operands[4][3]
-        AA4 = coupling_table(p, A4, A4, p.lmax[3], 4, canonical=True)
-        AAAA = coupling_table(p, AA4, AA4, 0, 4, canonical=True)
-
-    if p.max_order > 3:
-        AAAA = crop(AAAA)
-        AA4 = crop(AA4, [(AAAA, "left_inds"), (AAAA, "right_inds")], density=False)
-    if p.max_order > 2:
-        AAA = crop(AAA)
-        AA3 = crop(AA3, [(AAA, "left_inds")], density=False)
-    if p.max_order > 1:
-        AA = crop(AA)
-
-    if p.max_order > 1:
-        rows, (left, right) = factors(2, AA, ("A2_1", 1), ("A2_2", 2))
-        aa, indices = build_coupling(p, AA, 2, *rows)
-        AA_node = ("AA", AA, indices, left, right)
-    if p.max_order > 2:
-        rows, (left, right) = factors(3, AA3, ("A3_1", 1), ("A3_2", 2))
-        aa3, indices = build_coupling(p, AA3, 3, *rows)
-        AA3_node = ("AA3", AA3, indices, left, right)
-        rows, (_, right) = factors(3, AAA, None, ("A3_3", 3))
-        aaa, indices = build_coupling(p, AAA, 3, *rows)
-        AAA_node = ("AAA", AAA, indices, AA3_node, right)
-    if p.max_order > 3:
-        halves = [AA4, AA4]
-        if by_channel:
-            # each invariant gets its own copy of the AA4 rows it reads, so build_wrad keys on the invariant too
-            for side, col in enumerate(("left_inds", "right_inds")):
-                copies, reads, start = [], [], 0
-                for c, rows in enumerate(AAAA[col]):
-                    copies.append(AA4.iloc[rows].assign(invariant=c))
-                    reads.append(np.arange(start, start + len(rows)))
-                    start += len(rows)
-                halves[side] = pd.concat(copies, ignore_index=True)
-                AAAA[col] = reads
-        rows, (left, right) = factors(4, halves[0], ("A4_1", 1), ("A4_2", 2))
-        aa4_1, indices = build_coupling(p, halves[0], 4, *rows)
-        half_1 = ("AA4_1", halves[0], indices, left, right)
-        rows, (left, right) = factors(4, halves[1], ("A4_3", 3), ("A4_4", 4))
-        aa4_2, indices = build_coupling(p, halves[1], 4, *rows)
-        half_2 = ("AA4_2", halves[1], indices, left, right)
-        aaaa, indices = build_coupling(p, AAAA, 4)
-        AAAA_node = ("AAAA", AAAA, indices, half_1, half_2)
+        # how each factor f gets a_f from A, and which entry of a_f each term reads
+        nout, nin = p.n_rad_max[rank - 1], p.n_rad_base[1]
+        weights, cols, rows, term_index = [None] * rank, [None] * rank, [None] * rank, [None] * rank
+        for f in range(rank):
+            term_index[f] = torch.tensor([l * l + l + m for t in lms for l, m in [t[f]]], device=p.device)
+            if p.radial == "linear" and rank > 1:
+                # one radial mixing per factor, shared by every invariant and rank
+                weights[f] = f"wrad.{f + 1}"
+                if weights[f] not in p.params:
+                    learn_wrad(p, weights[f], f + 1, 1, nout, nin)
+            elif p.radial == "linear_max" and rank > 1:
+                # each invariant mixes its own radials, so only the block of A at its l is mixed
+                weights[f] = f"wrad.{rank}.{f + 1}"
+                learn_wrad(p, weights[f], f + 1, len(terms), nout, nin)
+                if p.central_rank > 1:
+                    central_mixture(p, weights[f], p.params[weights[f]])
+                lf = [C.shape[f] // 2 for C in tensors]
+                start = np.cumsum([0] + [2 * l + 1 for l in lf])
+                cols[f] = torch.tensor([l * l + m for l in lf for m in range(2 * l + 1)], device=p.device)
+                rows[f] = torch.tensor([c for c, l in enumerate(lf) for _ in range(2 * l + 1)], device=p.device)
+                term_index[f] = torch.tensor([start[c] + l + m for c, t in zip(invariant, lms) for l, m in [t[f]]],
+                                             device=p.device)
+        ranks.append((nout, len(terms), torch.tensor(invariant, device=p.device),
+                      torch.tensor(cg, dtype=DTYPE, device=p.device), weights, cols, rows, term_index))
+        layouts.append((terms, weights))
 
     def B(batch):
-        mu_i = batch["atomic_mu_i"]
-        A_nlm = A(batch)
-        radial = {name: transform(A_nlm, mu_i)
-                  for name, transform in transforms.items()}
-        polys = [A_nlm[:, :p.n_rad_max[0]]]
-        if p.max_order > 1:
-            polys.append(aa(radial["A2_1"], radial["A2_2"]))
-        if p.max_order > 2:
-            polys.append(aaa(aa3(radial["A3_1"], radial["A3_2"]),
-                             radial["A3_3"]))
-        if p.max_order > 3:
-            polys.append(aaaa(aa4_1(radial["A4_1"], radial["A4_2"]),
-                              aa4_2(radial["A4_3"], radial["A4_4"])))
-        return polys
+        A_nlm, mu_i = A(batch), batch["atomic_mu_i"]
+        out = []
+        for nout, n, invariant, cg, weights, cols, rows, term_index in ranks:
+            v = cg
+            for name, col, row, index in zip(weights, cols, rows, term_index):
+                if name is None:
+                    a = A_nlm[:, :nout]
+                elif p.radial == "linear":
+                    a = torch.einsum("ki,ail->akl", p.params[name][0, :nout], A_nlm)
+                elif p.central_rank > 1:
+                    w = torch.einsum("er,r...->e...", p.params["central.embedding"], p.params[name])
+                    a = torch.einsum("acki,aic->akc", w[:, row][mu_i], A_nlm[:, :, col])
+                else:
+                    a = torch.einsum("cki,aic->akc", p.params[name][row], A_nlm[:, :, col])
+                v = v * a[:, :, index]
+            out.append(v.new_zeros((v.shape[0], nout, n)).index_add_(2, invariant, v))
+        return out
 
-    return B, [("A", A_table), AA_node, AAA_node, AAAA_node][:p.max_order]
+    return B, layouts
 
 
-def build_fs_embedding(p, B, densities):
+def build_fs_embedding(p):
     learned = isinstance(p.fs_parameters, int)
     if learned:
         n = p.fs_parameters
@@ -716,15 +522,11 @@ def build_fs_embedding(p, B, densities):
         nonlinear = (mexp - 1.0).abs() >= 1e-10
         m0 = torch.where(nonlinear, mexp, 2.0)
 
-    def embedding(batch):
+    def embedding(rho):
         m = torch.cat([linear_slot, torch.exp(logm)]) if learned else m0
         m = torch.where((m - 1.0).abs() < 1e-6, 1.0 + 1e-6, m)
         nx = 1.0 / m
         xgain, ygain = nx ** (nx / (1.0 - nx)), nx ** (1.0 / (1.0 - nx))
-        blocks = B(batch)
-        mu_i = batch["atomic_mu_i"]
-        rho = sum(density(block, mu_i)
-                  for density, block in zip(densities, blocks))
         r = torch.where(nonlinear, rho, 0.0)
         sign = torch.where(r >= 0, 1.0, -1.0)
         arho = sign * r
@@ -735,7 +537,7 @@ def build_fs_embedding(p, B, densities):
     return embedding
 
 
-def build_mlp_embedding(p, B, densities):
+def build_mlp_embedding(p):
     activate = getattr(torch.nn.functional, p.activation)
     widths = [p.n_mlp_dens, *p.mlp_hidden, 1]
     layers = []
@@ -749,11 +551,7 @@ def build_mlp_embedding(p, B, densities):
             w = learn_diagonal(p, name, nin, nout)
         layers.append(w)
 
-    def embedding(batch):
-        blocks = B(batch)
-        mu_i = batch["atomic_mu_i"]
-        rho = sum(density(block, mu_i)
-                  for density, block in zip(densities, blocks))
+    def embedding(rho):
         x = rho[:, 1:]
         for w in layers[:-1]:
             x = activate(x @ w)
@@ -765,34 +563,30 @@ def build_mlp_embedding(p, B, densities):
 def build_energy(p):
     if p.seed is not None:
         torch.manual_seed(p.seed)
-    p.keep_parity = [[l, q] for l in range(max(p.lmax) + 1)
-                     for q in (((-1) ** l,) if p.parity == "real" else (-1, 1))]
 
     basis = (build_clamped_beam(p.n_rad_base[0], p.rcut, p.rclamp, p.device)
              if p.basis_type == "ClampedBeam" else
              build_sbessel(p.n_rad_base[0], p.rcut))
 
-    A, A_table = build_A(p, basis)
-
-    if "linear" in p.radial:
-        B, roots = build_wrad_B_basis(p, A, A_table)
-    else:
-        B, roots = build_B_basis(p, A, A_table)
-
-    densities = [build_density(p, name, node[1], rank) for rank, (name, node)
-                 in enumerate(zip(("A", "AA", "AAA", "AAAA"), roots), start=1)]
+    B, layouts = build_B(p, build_A(p, basis))
+    # rho[i, d] = sum over ranks of c[mu_i, d, n, invariant] B[i, n, invariant] / sqrt(n_rad_max)
     if p.n_mlp_dens is None:
-        embedding = build_fs_embedding(p, B, densities)
+        ndens = p.fs_parameters if isinstance(p.fs_parameters, int) else len(p.fs_parameters)
     else:
-        embedding = build_mlp_embedding(p, B, densities)
+        ndens = p.n_mlp_dens + 1
+    densities = [learn(p, f"density.{rank}", len(p.element_map), ndens, p.n_rad_max[rank - 1], len(terms),
+                       fill=None if p.init == "grace" else 0.0) for rank, (terms, _) in enumerate(layouts, start=1)]
+    embedding = build_fs_embedding(p) if p.n_mlp_dens is None else build_mlp_embedding(p)
     if p.zbl:
         zbl = build_zbl(p)
 
     def energy(batch):
-        e = embedding(batch) * p.out_scale + p.out_shift
+        mu_i = batch["atomic_mu_i"]
+        rho = sum(torch.einsum("aknv,anv->ak", c[mu_i], b) * c.shape[2] ** -0.5 for c, b in zip(densities, B(batch)))
+        e = embedding(rho) * p.out_scale + p.out_shift
         return e + zbl(batch) if p.zbl else e
 
-    return energy, roots
+    return energy, layouts
 
 
 def energy_forces(energy, batch):
@@ -820,14 +614,24 @@ def energy_forces(energy, batch):
 def weight_df(train_df, test_df, DE, DF):
     datasets = [train_df] + ([] if test_df is None else [test_df])
     if DE is not None:
-        df = pd.concat(datasets, ignore_index=True)
-        df["energy_corrected_per_atom"] = df["energy_corrected"] / df["ase_atoms"].map(len)
-        call_grace_no_tf("data/process_df.py").compute_convexhull_dist(
-            df, energy_per_atom_column="energy_corrected_per_atom",
-            verbose=False, max_allowed_elements=None)
-        distances = df["e_chull_dist_per_atom"].to_numpy()
-        distances = (np.split(distances, [len(train_df)]) if test_df is not None
-                     else [distances])
+        # distance per atom above the lower convex hull of formation energies, pure elements at their lowest energy
+        atoms = [a for dataset in datasets for a in dataset["ase_atoms"]]
+        e = np.concatenate([dataset["energy_corrected"].to_numpy() / dataset["ase_atoms"].map(len).to_numpy()
+                            for dataset in datasets])
+        elements = sorted({s for a in atoms for s in a.get_chemical_symbols()})
+        c = np.array([[a.get_chemical_symbols().count(el) / len(a) for el in elements] for a in atoms])
+        pure = np.zeros(len(elements))
+        for k in range(len(elements)):
+            if (c[:, k] == 1).any():
+                pure[k] = e[c[:, k] == 1].min()
+        e = e - c @ pure
+        if len(np.unique(c, axis=0)) > 1:
+            lower = ConvexHull(np.column_stack([c[:, :-1], e])).equations
+            lower = lower[lower[:, -2] < 0]
+            e = e - np.max(-(lower[:, -1] + c[:, :-1] @ lower[:, :-2].T) / lower[:, -2], axis=1)
+        else:
+            e = e - e.min()
+        distances = np.split(e, [len(train_df)])[:len(datasets)]
     else:
         distances = [np.zeros(len(dataset)) for dataset in datasets]
     for dataset, distance in zip(datasets, distances):
@@ -934,19 +738,11 @@ def all_reduce(tensor):
 
 # --- the compiled batch loss ---
 
-METRIC_KEYS = ("loss/energy", "loss/forces", "loss/l2",
-               "abs/depa", "sqr/depa", "abs/df", "sqr/df")
-
-
-def build_batch_loss(energy, params, device, energy_delta, forces_delta, l2_reg):
+def build_batch_loss(energy, device, energy_delta, forces_delta):
     energy_delta = torch.tensor(energy_delta, dtype=DTYPE, device=device)
     forces_delta = torch.tensor(forces_delta, dtype=DTYPE, device=device)
-    l2_reg = torch.tensor(l2_reg, dtype=DTYPE, device=device)
-    unregularized = {"fs.logm"} | {name for name in params if name.startswith("mlp.") and name != "mlp.0"}
-    regularized = [w for name, w in params.items() if name not in unregularized]
 
-    def batch_loss(batch, nstruct, natoms, energy_weight, forces_weight,
-                   l2_scale):
+    def batch_loss(batch):
         total_energy, total_forces = energy_forces(energy, batch)
 
         # the last structure slot carries the padding's constant shift, so its row is dropped
@@ -960,212 +756,16 @@ def build_batch_loss(energy, params, device, energy_delta, forces_delta, l2_reg)
         huber_df = functional.huber_loss(df, torch.zeros_like(df),
                                          delta=forces_delta, reduction="none")
 
-        metrics = torch.stack([
-            energy_weight * (batch["energy_weight"][:-1] * huber_depa).sum()
-                / nstruct,
-            forces_weight * (batch["force_weight"] * huber_df).sum()
-                / (natoms * 3.0),
-            sum((w * w).sum() for w in regularized) * l2_reg * l2_scale
-                * (energy_weight + forces_weight),
+        return torch.stack([
+            (batch["energy_weight"][:-1] * huber_depa).sum(),
+            (batch["force_weight"] * huber_df).sum(),
             depa.abs().sum(),
             (depa * depa).sum(),
             df.abs().sum(),
             (df * df).sum(),
         ])
-        return metrics[:3].sum(), metrics
 
     return batch_loss
-
-
-# --- BFGS ---
-
-def get_flat_trainable_variables(params):
-    return torch.cat([w.detach().reshape(-1) for w in params.values()])
-
-
-def set_flat_trainable_variables(params, flat):
-    offset = 0
-    with torch.no_grad():
-        for w in params.values():
-            w.copy_(flat[offset:offset + w.numel()].view_as(w))
-            offset += w.numel()
-
-
-# --- export ---
-
-def flat(a):
-    return [float(v) for v in np.asarray(a).reshape(-1)]
-
-
-def monomials(node, channel, cache):
-    # one channel of a tree node as [(factors, coeff)], a factor being (leaf, l, m, row, radial)
-    key = (id(node), channel)
-    if key not in cache:
-        if len(node) == 2:
-            name, table = node
-            row = table.iloc[channel]
-            cache[key] = [(((name, int(row["l"]), int(row["m"]), channel,
-                             row.get("radial")),), 1.0)]
-        else:
-            _, _, indices, left, right = node
-            if ("triplets", id(node)) not in cache:
-                triplets = {}
-                for i, j, c, s in zip(*(t.reshape(-1).tolist() for t in indices)):
-                    triplets.setdefault(s, []).append((i, j, c))
-                cache[("triplets", id(node))] = triplets
-            cache[key] = [(fl + fr, cg * cl * cr)
-                          for i, j, cg in cache[("triplets", id(node))][channel]
-                          for fl, cl in monomials(left, i, cache)
-                          for fr, cr in monomials(right, j, cache)]
-    return cache[key]
-
-
-def basis_functions(p, roots):
-    coefficients = [w.detach() for name, w in p.params.items()
-                    if name.startswith("density.")]
-    cache, out = {}, []
-    for node, w in zip(roots, coefficients):
-        invariants = collect(node[1], max_l=0, l_p=[[0, 1]])[0]
-        for column, channel in enumerate(invariants.tolist()):
-            expansion = [(sorted(f), c) for f, c in monomials(node, channel, cache)]
-            (ls,) = {tuple(l for _, l, _, _, _ in f) for f, _ in expansion}
-            radials = ()
-            if p.wrad and len(ls) > 1:
-                (radials,) = {tuple((name, l, int(radial))
-                                    for name, l, _, _, radial in factors)
-                              for factors, _ in expansion}
-            ms = [m for f, _ in expansion for _, _, m, _, _ in f]
-            cgs = [c for _, c in expansion]
-            out += [(list(ls), ms, cgs, w, column, n, list(radials))
-                    for n in range(w.shape[2])]
-    out.sort(key=lambda x: (len(x[0]), x[5], x[0]))
-    return out
-
-
-def header(p):
-    crad = p.params["crad"].detach().numpy()
-    crad = crad.reshape(crad.shape[0], -1, crad.shape[-1])
-
-    z = p.params["z"].detach().numpy()
-    if "z_proj" in p.params:      # a factored Zn, fold the projection in
-        proj = p.params["z_proj"].detach().numpy()
-        Z = z @ (proj * proj.shape[0] ** -0.5)
-    elif z.ndim == 1:             # one weight per element, all radials alike
-        Z = np.repeat(z[:, None], crad.shape[0], axis=1)
-    else:
-        Z = z                     # already indexed by radial channel and by l
-
-    mlp = [w.detach().numpy() for name, w in p.params.items()
-           if name.startswith("mlp.")]
-    if mlp:
-        widths = [w.shape[-2] for w in mlp] + [mlp[-1].shape[-1]]
-        emb = {"type": "EmbeddedLinMLP", "activation": p.activation, "rms_norm": False,
-               "layers_config": [int(v) for v in widths],
-               "params": [v for w in mlp for v in flat(w)]}
-    else:
-        fs = p.fs_parameters
-        if "fs.logm" in p.params:
-            m = np.exp(p.params["fs.logm"].detach().numpy())
-            m = np.where(np.abs(m - 1.0) < 1e-6, 1.0 + 1e-6, m)
-            fs = [[1.0, 1.0]] + [[1.0, v] for v in m]
-        emb = {"type": "FinnisSinclairShiftedScaled", "params": flat(fs)}
-
-    radial = {
-        "radbasename": p.basis_type, "n_rad_base": int(crad.shape[-1]),
-        "nradmax": max(int(w.shape[2]) for name, w in p.params.items()
-                       if name.startswith("density.")),
-        "cutoff": float(p.rcut),
-        "crad": flat(crad), "crad_shape": [int(s) for s in crad.shape],
-        "Z": flat(Z), "Z_shape": [int(s) for s in Z.shape],
-    }
-    if p.zbl:
-        radial["subtract_zbl"] = True
-    if p.basis_type == "ClampedBeam":
-        radial["rclamp"] = float(p.rclamp)
-    return {
-        "elements": [e for e, _ in sorted(p.element_map.items(),
-                                          key=lambda kv: kv[1])],
-        "nnorm": float(1.0 / p.avg_n_neigh),
-        "emb_spec": emb,
-        "radial_basis": radial,
-    }
-
-
-def export_to_yaml(p, roots, filename):
-    # the format has no central element axis, so it would read a wrong model
-    if p.central_rank > 1 or p.chemistry == "Zinl":
-        raise SystemExit(f"radial={p.radial!r} chemistry={p.chemistry!r} "
-                         f"has a central element axis the format cannot store")
-
-    top = header(p)
-    functions = basis_functions(p, roots)
-
-    # a model without mixing reads raw radials, ns = n + 1 in every slot
-    row_number = {(idx_poly, factor_idx): n + 1
-                  for idx_poly, (ls, _, _, _, _, n, _) in enumerate(functions)
-                  for factor_idx in range(len(ls))}
-    if p.wrad:
-        wrad = {}
-        for name, weight in p.wrad.items():
-            weight = weight.detach().numpy()
-            wrad[name] = weight.reshape(-1, weight.shape[-1])
-        nrad_A = top["radial_basis"]["crad_shape"][0]
-        owned_rows = []
-        for idx_poly, (ls, _, _, _, _, n, radials) in enumerate(functions):
-            for factor_idx, l in enumerate(ls):
-                if radials:
-                    name, _, base = radials[factor_idx]
-                    row = base + n
-                    if p.radial == "linear":
-                        row %= len(wrad[name])
-                    values = wrad[name][row]
-                else:
-                    values = np.zeros(nrad_A)
-                    values[n] = 1.0
-                owned_rows.append((l, idx_poly, factor_idx, values))
-        owned_rows.sort(key=lambda item: item[0])
-        row_number = {(idx_poly, factor_idx): idx + 1
-                      for idx, (_, idx_poly, factor_idx, _) in enumerate(owned_rows)}
-        rows = [values for _, _, _, values in owned_rows]
-        top["radial_basis"]["wrad"] = flat(rows)
-        top["radial_basis"]["wrad_shape"] = list(np.shape(rows))
-        lcount = [0] * (owned_rows[-1][0] + 1)
-        for l, _, _, _ in owned_rows:
-            lcount[l] += 1
-        top["radial_basis"]["wrad_lcount"] = lcount
-    top["shift"] = float(p.out_shift)
-    top["scale"] = float(p.out_scale)
-
-    # only mu0 and coeff differ by element, so the rest is built once
-    polynomials = []
-    for idx_poly, (ls, ms, cgs, w, column, n, radials) in enumerate(functions):
-        ns = [row_number[(idx_poly, factor_idx)]
-              for factor_idx in range(len(ls))]
-        fn = {"rank": len(ls), "ls": ls, "ns": ns, "ms_combs": ms,
-              "gen_cgs": flat(cgs), "ndensity": w.shape[1]}
-        polynomials.append((fn, w, column, n))
-
-    dump = lambda v: yaml.safe_dump(v, default_flow_style=True, sort_keys=False,
-                                    width=999999).removesuffix("...\n")
-    with open(filename, "w") as f:
-        for key, value in top.items():
-            f.write(f"{key}: " + dump(value))
-        f.write("functions:\n")
-        for el in range(len(top["elements"])):
-            f.write(f"    {el}:\n")
-            for fn, w, column, n in polynomials:
-                f.write("     - " + dump({"mu0": el, **fn, "coeff": flat(
-                    w[el, :, n, column] * w.shape[2] ** -0.5)}) + "\n")
-
-
-def export(checkpoint_file, filename):
-    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
-    p = Potential(**checkpoint["potential"], device=torch.device("cpu"))
-    _, roots = build_energy(p)
-    with torch.no_grad():
-        for w, saved in zip(p.params.values(), checkpoint["model"].values()):
-            w.copy_(saved)
-    export_to_yaml(p, roots, filename)
 
 
 # --- driver ---
@@ -1298,72 +898,69 @@ def main(argv=None):
         element_map, **potential_kwargs,
         rcut=rcut, seed=seed, avg_n_neigh=avg_n_neigh, zbl=subtract_zbl,
         device=device)
-    if isinstance(model.n_rad_base, int):
-        model.n_rad_base = (model.n_rad_base, model.n_rad_base)
-    if model.chemistry is None:
-        model.chemistry = "Zn" if "linear" in model.radial else "Zembed"
-    if model.mlp_hidden is None and model.n_mlp_dens is not None:
-        model.mlp_hidden = (model.n_mlp_dens,)
-    (energy, _), params = build_energy(model), model.params
+    energy, _ = build_energy(model)
+    params = model.params
 
     batch_loss = build_batch_loss(
-        energy, params, device, loss.get("energy", {}).get("delta", 0.01),
-        loss.get("forces", {}).get("delta", 0.01), loss.get("l2_reg", 0.0))
+        energy, device, loss.get("energy", {}).get("delta", 0.01),
+        loss.get("forces", {}).get("delta", 0.01))
     # Inductor miscompiles the backward on CPU, so CPU runs eager
     if fit_config.get("jit_compile", False) and device.type == "cuda":
         batch_loss = torch.compile(batch_loss, dynamic=False,
                                    mode="reduce-overhead")
         report("JIT compilation: True (mode=reduce-overhead)")
 
-    energy_weight = torch.tensor(loss.get("energy", {}).get("weight", 1.0),
-                                 dtype=DTYPE, device=device)
-    forces_weight = torch.tensor(loss.get("forces", {}).get("weight", 100.0),
-                                 dtype=DTYPE, device=device)
+    energy_weight = loss.get("energy", {}).get("weight", 1.0)
+    forces_weight = loss.get("forces", {}).get("weight", 100.0)
+    stages = [(energy_weight, forces_weight),
+              (switch.get("energy", {}).get("weight", energy_weight), switch.get("forces", {}).get("weight", forces_weight))]
+    l2_reg = loss.get("l2_reg", 0.0)
+    l2_mask = []
+    for name, w in params.items():
+        unregularized = name == "fs.logm" or (name.startswith("mlp.") and name != "mlp.0")
+        l2_mask.append(torch.full((w.numel(),), 0.0 if unregularized else 1.0, dtype=DTYPE, device=device))
+    l2_mask = torch.cat(l2_mask)
     epochs = fit_config.get("maxiter", 500)
     checkpoint_freq = fit_config.get("checkpoint_freq", 100)
     switch_after = switch.get("after_iter")
-    switch_energy_weight = switch.get("energy", {}).get("weight")
-    switch_forces_weight = switch.get("forces", {}).get("weight")
     best_test_loss, switched = math.inf, False
 
     def run_pass(batches, totals, gradient):
-        nbatches = len(batches)
-        denominator = totals.clamp(min=1.0) / nbatches
-        nstruct, natoms = (float(x) for x in totals)
-        l2_scale = torch.tensor(1.0 / world_size if gradient else 0.0,
-                                dtype=DTYPE, device=device)
-        acc_metrics = torch.zeros(len(METRIC_KEYS), dtype=DTYPE, device=device)
-        grad = None
+        # loss = ew sum huber(depa) / nstruct + fw sum huber(df) / (3 natoms) + l2_reg (ew + fw) sum w^2
+        nstruct, natoms = totals.clamp(min=1.0).tolist()
+        ew, fw = stages[switched]
+        scale = torch.tensor([ew / nstruct, fw / (3 * natoms)], dtype=DTYPE, device=device)
+        sums, grad = torch.zeros(6, dtype=DTYPE, device=device), 0.0
         t_start = time.perf_counter()
-
         for batch in batches:
             torch.compiler.cudagraph_mark_step_begin()
-            total_loss, metrics = batch_loss(
-                batch, denominator[0], denominator[1],
-                energy_weight, forces_weight, l2_scale)
+            metrics = batch_loss(batch)
             if gradient:
-                total_loss.backward()
+                (scale * metrics[:2]).sum().backward()
                 # the cat copies each gradient out of the cudagraph pool
-                g = torch.cat([w.grad.reshape(-1) for w in params.values()])
-                grad = g if grad is None else grad + g
+                grad = grad + torch.cat([w.grad.reshape(-1) for w in params.values()])
                 for w in params.values():
                     w.grad = None
-            acc_metrics += metrics.detach()
-            del total_loss, metrics
+            sums += metrics.detach()
+            del metrics
+        e, f, abs_depa, sqr_depa, abs_df, sqr_df = all_reduce(sums).tolist()
 
-        all_reduce(acc_metrics)
-        summed = dict(zip(METRIC_KEYS, acc_metrics.detach().cpu().numpy()))
-        losses = {key: float(summed[key]) / nbatches for key in METRIC_KEYS[:3]}
+        l2 = 0.0
+        if gradient:
+            x = torch.cat([w.detach().reshape(-1) for w in params.values()])
+            l2 = l2_reg * (ew + fw) * float((l2_mask * x * x).sum())
+            grad = all_reduce(grad) + 2 * l2_reg * (ew + fw) * l2_mask * x
+        losses = {"loss/energy": e * ew / nstruct, "loss/forces": f * fw / (3 * natoms), "loss/l2": l2}
         return {
             **losses,
             "total_loss": sum(losses.values()),
-            "mae/depa": summed["abs/depa"] / nstruct,
-            "rmse/depa": math.sqrt(summed["sqr/depa"] / nstruct),
-            "mae/f_comp": summed["abs/df"] / natoms / 3,
-            "rmse/f_comp": math.sqrt(summed["sqr/df"] / natoms / 3),
-            "total_time/per_atom": (time.perf_counter() - t_start) / max(natoms, 1),
-            "n_batches": nbatches,
-        }, None if grad is None else all_reduce(grad / nbatches)
+            "mae/depa": abs_depa / nstruct,
+            "rmse/depa": math.sqrt(sqr_depa / nstruct),
+            "mae/f_comp": abs_df / natoms / 3,
+            "rmse/f_comp": math.sqrt(sqr_df / natoms / 3),
+            "total_time/per_atom": (time.perf_counter() - t_start) / natoms,
+            "n_batches": len(batches),
+        }, grad if gradient else None
 
     def save_checkpoint(name, epoch):
         if rank:
@@ -1391,65 +988,21 @@ def main(argv=None):
         best_test_loss, switched = checkpoint["best_test_loss"], checkpoint["switched"]
         return checkpoint["epoch"]
 
-    def epoch_end(epoch, train_metrics):
-        nonlocal best_test_loss
-        with torch.no_grad():
-            test_metrics = (run_pass(test, test_totals, False)[0]
-                            if test is not None else None)
-
-        both = lambda key, scale=1.0, fmt=".3e": (
-            f"{train_metrics[key] * scale:{fmt}}" if test_metrics is None else
-            f"{train_metrics[key] * scale:{fmt}} ({test_metrics[key] * scale:{fmt}})")
-        report(f"Iteration #{epoch}/{epochs} TRAIN(TEST): " + " ".join(
-            f"{key}: {both(key)}" for key in
-            ("total_loss", "mae/depa", "rmse/depa", "mae/f_comp", "rmse/f_comp")
-        ) + f" Time(mcs/at): {both('total_time/per_atom', 1e6, '.0f')}")
-
-        if rank == 0:
-            for name, metrics in (("train", train_metrics), ("test", test_metrics)):
-                if metrics is None:
-                    continue
-                filename = os.path.join(output_dir, f"{name}_metrics.yaml")
-                with open(filename, "at") as f:
-                    print("-", json.dumps({**{k: float(v) for k, v in metrics.items()},
-                                           "epoch": epoch}), file=f)
-
-        if test_metrics is not None and test_metrics["total_loss"] < best_test_loss:
-            best_test_loss = test_metrics["total_loss"]
-            report(f"New best test loss found ({best_test_loss:.5e}), checkpointing")
-            save_checkpoint("checkpoint.best_test_loss", epoch)
-        if epoch % checkpoint_freq == 0:
-            report("Regular checkpointing")
-            save_checkpoint("checkpoint", epoch)
-
-    def switch_loss(epoch=None):
-        nonlocal best_test_loss
-        if epoch is not None:
-            if load_checkpoint("checkpoint.best_test_loss") is not None:
-                report("Loading best test loss model")
-            save_checkpoint("checkpoint.stage1.best_test_loss", epoch)
-            best_test_loss = math.inf  # bests under the old loss are not comparable
-        if switch_energy_weight is not None:
-            energy_weight.fill_(float(switch_energy_weight))
-        if switch_forces_weight is not None:
-            forces_weight.fill_(float(switch_forces_weight))
-        report(f"Switching loss weights to energy={float(energy_weight)}, "
-               f"forces={float(forces_weight)}")
-
     report("Start BFGS optimization")
     opt_params = fit_config.get("opt_params", {})
     gtol = opt_params.get("gtol", 1e-8)
     c1, c2 = opt_params.get("c1", 1e-4), opt_params.get("c2", 0.9)
-    cache = {"x": None, "fval": None, "jac": None, "metrics": None, "neval": 0}
     on_device = lambda a: torch.as_tensor(a, dtype=DTYPE, device=device)
+    last ={"x": None, "neval": 0}
 
     def eval_at(x):
-        if cache["x"] is None or not np.array_equal(x, cache["x"]):
-            set_flat_trainable_variables(params, on_device(x))
-            metrics, grad = run_pass(train, train_totals, True)
-            cache.update(x=x.copy(), metrics=metrics, neval=cache["neval"] + 1,
-                         fval=metrics["total_loss"], jac=grad)
-        return cache["fval"], cache["jac"]
+        if not np.array_equal(x, last["x"]):
+            with torch.no_grad():
+                for w, v in zip(params.values(), on_device(x).split([w.numel() for w in params.values()])):
+                    w.copy_(v.view_as(w))
+            last["metrics"], last["grad"] = run_pass(train, train_totals, True)
+            last.update(x=x.copy(), neval=last["neval"] + 1)
+        return last["metrics"]["total_loss"], last["grad"]
 
     f_scipy = lambda x: eval_at(x)[0]
     g_scipy = lambda x: eval_at(x)[1].detach().cpu().numpy()
@@ -1458,15 +1011,12 @@ def main(argv=None):
     if restart:
         epoch = load_checkpoint(restart)
         report(f"Restarting from epoch {epoch}")
-        # the loss weights come back from input.yaml at stage 1
-        if switched:
-            switch_loss()     # weights only, the loop banked stage 1 already
-    xk = get_flat_trainable_variables(params).cpu().numpy().copy()
+    xk = torch.cat([w.detach().reshape(-1) for w in params.values()]).cpu().numpy()
     row0 = xk.size * rank // world_size
     row1 = xk.size * (rank + 1) // world_size
 
     def restart_at(x, H=None):
-        cache["x"] = None
+        last["x"] = None
         fval, g = eval_at(x)
         g = g.clone()
         # makes the first direction invariant to the loss's overall scale
@@ -1484,9 +1034,13 @@ def main(argv=None):
 
     while float(gfk.abs().max()) * gscale > gtol and epoch < epochs:
         if not switched and epoch == switch_after:
-            switch_loss(epoch)
-            switched = True
-            xk = get_flat_trainable_variables(params).cpu().numpy().copy()
+            if load_checkpoint("checkpoint.best_test_loss") is not None:
+                report("Loading best test loss model")
+            save_checkpoint("checkpoint.stage1.best_test_loss", epoch)
+            # bests under the old loss are not comparable
+            best_test_loss, switched = math.inf, True
+            report(f"Switching loss weights to energy={stages[1][0]}, forces={stages[1][1]}")
+            xk =torch.cat([w.detach().reshape(-1) for w in params.values()]).cpu().numpy()
             Hk, old_fval, old_old_fval, gfk, gscale = restart_at(xk, Hk)
 
         pk = torch.zeros_like(gfk)
@@ -1513,9 +1067,30 @@ def main(argv=None):
         yk, gfk = gfkp1 - gfk, gfkp1
         epoch += 1
 
-        if not np.array_equal(cache["x"], xk):
-            eval_at(xk)
-        epoch_end(epoch, cache["metrics"])
+        eval_at(xk)
+        train_metrics = last["metrics"]
+        with torch.no_grad():
+            test_metrics = None if test is None else run_pass(test, test_totals, False)[0]
+        both = lambda key, scale=1.0, fmt=".3e": (
+            f"{train_metrics[key] * scale:{fmt}}" if test_metrics is None else
+            f"{train_metrics[key] * scale:{fmt}} ({test_metrics[key] * scale:{fmt}})")
+        report(f"Iteration #{epoch}/{epochs} TRAIN(TEST): " + " ".join(
+            f"{key}: {both(key)}" for key in
+            ("total_loss", "mae/depa", "rmse/depa", "mae/f_comp", "rmse/f_comp")
+        ) + f" Time(mcs/at): {both('total_time/per_atom', 1e6, '.0f')}")
+        if rank == 0:
+            for name, metrics in (("train", train_metrics), ("test", test_metrics)):
+                if metrics is None:
+                    continue
+                with open(os.path.join(output_dir, f"{name}_metrics.yaml"), "at") as f:
+                    print("-", json.dumps({**{k: float(v) for k, v in metrics.items()}, "epoch": epoch}), file=f)
+        if test_metrics is not None and test_metrics["total_loss"] < best_test_loss:
+            best_test_loss = test_metrics["total_loss"]
+            report(f"New best test loss found ({best_test_loss:.5e}), checkpointing")
+            save_checkpoint("checkpoint.best_test_loss", epoch)
+        if epoch % checkpoint_freq == 0:
+            report("Regular checkpointing")
+            save_checkpoint("checkpoint", epoch)
         if float(gfk.abs().max()) * gscale <= gtol:
             break
 
@@ -1529,13 +1104,129 @@ def main(argv=None):
         Hk.addr_(sk[row0:row1], sk, alpha=rhok * rhok * float(yk.dot(Hyk)) + rhok)
 
     report(f"BFGS optimization results: iterations={epoch}, "
-           f"function/gradient evaluations={cache['neval']}")
+           f"function/gradient evaluations={last['neval']}")
     save_checkpoint("checkpoint", epoch)
     if rank == 0:
         report("Exporting checkpoints/checkpoint to saved_model.yaml")
         export(os.path.join(output_dir, "checkpoints", "checkpoint"),
                os.path.join(output_dir, "saved_model.yaml"))
     return 0
+
+
+# --- export ---
+
+def export(checkpoint_file, filename):
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+    p = Potential(**checkpoint["potential"], device=torch.device("cpu"))
+    _, layouts = build_energy(p)
+    with torch.no_grad():
+        for w, saved in zip(p.params.values(), checkpoint["model"].values()):
+            w.copy_(saved)
+    # the format has no central element axis, so it would read a wrong model
+    if p.central_rank > 1 or p.chemistry == "Zinl":
+        raise SystemExit(f"radial={p.radial!r} chemistry={p.chemistry!r} "
+                         f"has a central element axis the format cannot store")
+
+    def flat(a):
+        return [float(v) for v in np.asarray(a).reshape(-1)]
+
+    # header
+    crad = p.params["crad"].detach().numpy()
+    crad = crad.reshape(crad.shape[0], -1, crad.shape[-1])
+    z = p.params["z"].detach().numpy()
+    if "z_proj" in p.params:      # a factored Zn, fold the projection in
+        proj = p.params["z_proj"].detach().numpy()
+        Z = z @ (proj * proj.shape[0] ** -0.5)
+    elif z.ndim == 1:             # one weight per element, all radials alike
+        Z = np.repeat(z[:, None], crad.shape[0], axis=1)
+    else:
+        Z = z                     # already indexed by radial channel and by l
+    mlp = [w.detach().numpy() for name, w in p.params.items() if name.startswith("mlp.")]
+    if mlp:
+        widths = [w.shape[-2] for w in mlp] + [mlp[-1].shape[-1]]
+        emb = {"type": "EmbeddedLinMLP", "activation": p.activation, "rms_norm": False,
+               "layers_config": [int(v) for v in widths],
+               "params": [v for w in mlp for v in flat(w)]}
+    else:
+        fs = p.fs_parameters
+        if "fs.logm" in p.params:
+            m = np.exp(p.params["fs.logm"].detach().numpy())
+            m = np.where(np.abs(m - 1.0) < 1e-6, 1.0 + 1e-6, m)
+            fs = [[1.0, 1.0]] + [[1.0, v] for v in m]
+        emb = {"type": "FinnisSinclairShiftedScaled", "params": flat(fs)}
+    coefficients = [w.detach() for name, w in p.params.items() if name.startswith("density.")]
+    radial = {
+        "radbasename": p.basis_type, "n_rad_base": int(crad.shape[-1]),
+        "nradmax": max(int(w.shape[2]) for w in coefficients),
+        "cutoff": float(p.rcut),
+        "crad": flat(crad), "crad_shape": [int(s) for s in crad.shape],
+        "Z": flat(Z), "Z_shape": [int(s) for s in Z.shape],
+    }
+    if p.zbl:
+        radial["subtract_zbl"] = True
+    if p.basis_type == "ClampedBeam":
+        radial["rclamp"] = float(p.rclamp)
+    top = {
+        "elements": [e for e, _ in sorted(p.element_map.items(), key=lambda kv: kv[1])],
+        "nnorm": float(1.0 / p.avg_n_neigh),
+        "emb_spec": emb,
+        "radial_basis": radial,
+        "shift": float(p.out_shift),
+        "scale": float(p.out_scale),
+    }
+
+    # basis functions, one per invariant and radial channel n
+    functions = []
+    for (terms, weights), w in zip(layouts, coefficients):
+        for column, expansion in enumerate(terms):
+            merged = {}
+            for lms, c in expansion.items():
+                lms = lms if weights[0] else tuple(sorted(lms))
+                merged[lms] = merged.get(lms, 0.0) + c
+            merged = [(lms, c) for lms, c in merged.items() if abs(c) > 1e-12]
+            ls = [l for l, _ in merged[0][0]]
+            ms = [m for lms, _ in merged for _, m in lms]
+            functions += [(ls, ms, [c for _, c in merged], w, column, n, weights) for n in range(w.shape[2])]
+    functions.sort(key=lambda x: (len(x[0]), x[5], x[0]))
+
+    # radial rows, each factor of each function owns one, numbered from 1 in order of l
+    if "linear" in p.radial:
+        wrad = {name: w.detach().numpy() for name, w in p.params.items() if name.startswith("wrad.")}
+        rows, place = {}, []
+        for ls, _, _, _, column, n, weights in functions:
+            place.append([])
+            for l, name in zip(ls, weights):
+                place[-1].append((l, len(rows.setdefault(l, []))))
+                if name is None:
+                    rows[l].append(np.eye(crad.shape[0])[n])
+                else:
+                    rows[l].append(wrad[name][column if p.radial == "linear_max" else 0, n])
+        before, count = {}, 0
+        for l in sorted(rows):
+            before[l], count = count, count + len(rows[l])
+        ns = [[before[l] + k + 1 for l, k in fn] for fn in place]
+        stacked = [v for l in sorted(rows) for v in rows[l]]
+        radial["wrad"] = flat(stacked)
+        radial["wrad_shape"] = list(np.shape(stacked))
+        radial["wrad_lcount"] = [len(rows.get(l, [])) for l in range(max(rows) + 1)]
+    else:
+        # a model without mixing reads raw radials, ns = n + 1 in every slot
+        ns = [[n + 1] * len(ls) for ls, _, _, _, _, n, _ in functions]
+
+    # write, only mu0 and coeff differ by element, so the rest is built once
+    polynomials = [({"rank": len(ls), "ls": ls, "ns": fn_ns, "ms_combs": ms, "gen_cgs": flat(cgs), "ndensity": w.shape[1]},
+                    w, column, n) for (ls, ms, cgs, w, column, n, _), fn_ns in zip(functions, ns)]
+    dump = lambda v: yaml.safe_dump(v, default_flow_style=True, sort_keys=False,
+                                    width=999999).removesuffix("...\n")
+    with open(filename, "w") as f:
+        for key, value in top.items():
+            f.write(f"{key}: " + dump(value))
+        f.write("functions:\n")
+        for el in range(len(top["elements"])):
+            f.write(f"    {el}:\n")
+            for fn, w, column, n in polynomials:
+                f.write("     - " + dump({"mu0": el, **fn, "coeff": flat(
+                    w[el, :, n, column] * w.shape[2] ** -0.5)}) + "\n")
 
 
 if __name__ == "__main__":
